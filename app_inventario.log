@@ -1,0 +1,14 @@
+2025-12-28 19:13:35 - flet - INFO - Assets path configured: C:\Users\anabe\Desktop\SAIDesktopApp\assets
+2025-12-28 19:13:35 - flet - INFO - Starting up TCP server on localhost:65344
+2025-12-28 19:13:35 - flet - INFO - Flet app has started...
+2025-12-28 19:13:35 - flet - INFO - App URL: tcp://localhost:65344
+2025-12-28 19:13:35 - flet_desktop - INFO - Starting Flet View app...
+2025-12-28 19:13:35 - flet_desktop - INFO - Looking for Flet executable at: C:\Users\anabe\Desktop\SAIDesktopApp\venv\Lib\site-packages\flet_desktop\app\flet\flet.exe
+2025-12-28 19:13:35 - flet_desktop - INFO - Flet View found in: C:\Users\anabe\Desktop\SAIDesktopApp\venv\Lib\site-packages\flet_desktop\app\flet\flet.exe
+2025-12-28 19:13:36 - flet - INFO - App session started
+2025-12-28 19:13:36 - __main__ - INFO - Iniciando la aplicación de login
+2025-12-28 19:13:36 - src.ui.router - INFO - Cambiando de ruta a: /login
+2025-12-28 19:14:30 - src.services.auth_service - INFO - Login exitoso para el usuario: 1001 (OPERATOR)
+2025-12-28 19:14:30 - src.ui.router - INFO - Cambiando de ruta a: /dashboard
+2025-12-28 19:15:35 - src.services.auth_service - INFO - Usuario 1001 ha cerrado sesión.
+2025-12-28 19:15:35 - src.ui.router - INFO - Cambiando de ruta a: /login
