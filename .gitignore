@@ -1,0 +1,11 @@
+# Ignorar carpetas de caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignorar archivos de variables de entorno (por seguridad)
+.env
+
+# Ignorar entornos virtuales
+venv/
+env/
