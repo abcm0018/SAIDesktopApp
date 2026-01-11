@@ -1,136 +1,109 @@
-import logging
 import json
-import time
 from datetime import datetime
-import paho.mqtt.client as mqtt
+import logging
+from typing import Dict
 
-# 1. Importamos la configuración y el cliente desde tu nuevo fichero
-# Asegúrate de que 'mqtt' sea el nombre correcto del fichero o ajusta la ruta (ej: from infrastructure.mqtt import ...)
-from mqtt import mqtt_client, MQTT_BROKER, MQTT_PORT, MQTT_TOPIC
+from src.core.mqtt_manager import MqttManager
+from src.domain.palet import PaletScanData
+from src.utils.date_time_formatter import DateTimeFormatter
 
-from src.model.palet import PaletScanData
-# Suponiendo que User está definido en algún lugar, si no, impórtalo o ajusta el type hinting
-# from src.model.user import User 
-
-from src.utils.formatters import (
-    formatear_fecha_gs1_a_java, 
-    formatear_hora_gs1_a_java
-)
-
-# Instancia del logger a nivel de clase/módulo
 logger = logging.getLogger(__name__)
 
+
 class MqttService:
+    """
+    Servicio de aplicación para publicación de datos de palets.
+    
+    Responsabilidades:
+    - Transformar objetos de dominio a formato JSON
+    - Validar datos antes de enviar
+    - Coordinar el envío a través del MqttManager
+    """
 
-    def __init__(self):
-        # 2. Usamos la instancia pre-configurada (Singleton pattern)
-        self.client = mqtt_client
-        
-        # Guardamos las constantes importadas
-        self.broker_host = MQTT_BROKER
-        self.broker_port = MQTT_PORT
-        self.topic = MQTT_TOPIC
-        
-        # 3. Sobrescribimos los callbacks del cliente importado.
-        # Esto es necesario para que los eventos (connect/disconnect) modifiquen
-        # el estado 'self.is_connected' de ESTA clase y usen tu logging específico.
-        self.client.on_connect = self._on_connect
-        self.client.on_disconnect = self._on_disconnect
-        self.client.on_publish = self._on_publish
-        
-        self.is_connected = False
-        
-        # Nota: El client_id ya viene configurado desde mqtt.py
-        logging.info(f"Servicio MQTT inicializado usando configuración de mqtt.py")
-
-    def _on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            logging.info(f"✅ Conectado exitosamente al broker MQTT en {self.broker_host}")
-            self.is_connected = True
-        else:
-            logging.error(f"❌ Fallo al conectar con MQTT, código: {rc}")
-            self.is_connected = False
-
-    def _on_disconnect(self, client, userdata, rc):
-        self.is_connected = False
-        if rc != 0:
-            logging.warning(f"Desconexión inesperada de MQTT. Código: {rc}.")
-        else:
-            logging.info("Desconectado de MQTT limpiamente.")
-
-    def _on_publish(self, client, userdata, mid):
-        logging.info(f"Mensaje MQTT (mid: {mid}) publicado exitosamente.")
-
-    # --- Implementación de la Interfaz ---
-
-    def connect(self):
-        if self.is_connected:
-            return
-        try:
-            # Usamos los parámetros importados para conectar
-            self.client.connect(self.broker_host, self.broker_port, keepalive=60)
-            self.client.loop_start() # Inicia el bucle en un hilo separado
-            
-            # Esperar a que la conexión se establezca
-            timeout = 5
-            while not self.is_connected and timeout > 0:
-                time.sleep(0.1)
-                timeout -= 0.1
-            
-            if not self.is_connected:
-                logging.error("Fallo de timeout al conectar con MQTT.")
-                self.client.loop_stop()
-
-        except Exception as e:
-            logging.error(f"Error al iniciar conexión MQTT: {e}")
-
-    def disconnect(self):
-        if self.client:
-            self.client.loop_stop()
-            self.client.disconnect()
-
-    def notify_palet_scanned(self, palet_data: PaletScanData, supervisor) -> bool:
+    def __init__(self, mqtt_manager: MqttManager):
         """
-        Publica los datos de un palet en el topic configurado.
+        Inicializa el servicio MQTT.
+        
+        Args:
+            mqtt_manager: Instancia del gestor de infraestructura MQTT.
         """
-        if not self.is_connected:
-            logging.error("❌ No se puede publicar: Cliente MQTT no conectado.")
+        self.mqtt_manager = mqtt_manager
+
+    def enviar_datos_palet(self, palet_data: PaletScanData, employee_number: str) -> bool:
+        """
+        Envía los datos de un palet escaneado al sistema backend.
+        
+        Args:
+            palet_data: Datos del palet escaneado.
+            employee_number: Número de empleado.
+            
+        Returns:
+            True si el envío fue exitoso, False en caso contrario.
+        """
+        # Validación de completitud
+        if not palet_data.is_complete():
+            logger.warning(f"Intento de envío de palet incompleto (SSCC: {palet_data.sscc or 'N/A'})")
             return False
-        
-        hora_actual = datetime.now().time()
-        fecha_simulada = datetime.combine(
-            datetime(2025, 11, 27).date(), 
-            hora_actual
-        )
-        
-        try:
-            # Preparamos el payload JSON
-            message_body = {
-                "ean": palet_data.ean,
-                "batchNumber": palet_data.batch_number,
-                "productUseByDate": formatear_fecha_gs1_a_java(palet_data.product_use_by_date),
-                "packagingDate": formatear_fecha_gs1_a_java(palet_data.packaging_date),
-                "productionTime": formatear_hora_gs1_a_java(palet_data.production_time),
-                "sscc": palet_data.sscc,
-                "employeeNumber": supervisor.employee_number,
-                "scanDate": fecha_simulada.isoformat(timespec='seconds')
-            }
-            
-            message = json.dumps(message_body, ensure_ascii=False)
-            
-            result = self.client.publish(
-                self.topic, # Usamos el topic importado
-                payload=message,
-                qos=1
-            )
 
-            if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                logging.info(f"Mensaje para SSCC {palet_data.sscc} enviado a la cola MQTT.")
+        # Validación de employee_number
+        if not employee_number or not isinstance(employee_number, str):
+            logger.error(f"Número de empleado inválido: {employee_number}")
+            return False
+
+        try:
+            # Construir payload
+            payload = self._build_payload(palet_data, employee_number)
+            
+            # Serializar a JSON
+            json_payload = json.dumps(payload, ensure_ascii=False, indent=None)
+            
+            # Enviar a través del gestor MQTT
+            enviado = self.mqtt_manager.publish_message(payload=json_payload)
+
+            if enviado:
+                logger.info(f"Palet {palet_data.sscc} enviado correctamente")
                 return True
             else:
-                logging.warning(f"Error al poner en cola el mensaje (código: {result.rc}).")
+                logger.error(f"Fallo al enviar palet {palet_data.sscc}")
                 return False
 
-        except Exception as e:
-            logging.error(f"Error durante la publicación MQTT: {e}")
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error de datos al construir payload: {e}")
             return False
+        except Exception as e:
+            logger.exception(f"Error crítico enviando datos de palet: {e}")
+            return False
+
+    def _build_payload(self, palet_data: PaletScanData, employee_number: str) -> Dict:
+        """
+        Construye el payload JSON para enviar al backend.
+        
+        NOTA: Asume que palet_data tiene fechas en formato UI (DD/MM/YYYY).
+        Las transforma a formato ISO (YYYY-MM-DD) para el backend Java.
+        
+        Args:
+            palet_data: Datos del palet.
+            employee_number: Número de empleado.
+            
+        Returns:
+            Diccionario con el payload formateado.
+        """
+        # Transformar fechas de formato UI a ISO
+        iso_use_by_date = DateTimeFormatter.ui_date_to_iso(palet_data.product_use_by_date)
+        iso_packaging_date = DateTimeFormatter.ui_date_to_iso(palet_data.packaging_date)
+        iso_production_time = DateTimeFormatter.ui_time_to_iso(palet_data.production_time)
+        
+        # Timestamp actual del escaneo
+        scan_timestamp = datetime.now().isoformat(timespec='seconds')
+        
+        return {
+            "sscc": palet_data.sscc,
+            "ean": palet_data.ean,
+            "batchNumber": palet_data.batch_number,
+            "productUseByDate": iso_use_by_date,
+            "packagingDate": iso_packaging_date,
+            "productionTime": iso_production_time,
+            "sscc": palet_data.sscc,
+            "employeeNumber": employee_number,
+            "scanDate": scan_timestamp
+        }
