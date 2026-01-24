@@ -9,3 +9,5 @@ class AppConfig:
     """
     APP_TITLE: str = os.getenv("APP_TITLE", "Sistema de Inventariado Automatizado")
     theme_mode: str = os.getenv("THEME_MODE", "light")
+    
+    READ_TIMEOUT_SEC = float(os.getenv("READ_TIMEOUT_SEC", "5"))

@@ -1,22 +1,22 @@
+import asyncio  # Necesario para la carga asíncrona
 import logging
-import asyncio # Necesario para la carga asíncrona
+
 import flet as ft
 
-from src.services.mqtt_service import MqttService
-from src.core.mqtt_manager import MqttManager
+from src.config.app_config import AppConfig
 from src.config.mqtt_config import MqttConfig
 from src.config.routes import AppRoutes
-from src.services.yolo_service import YoloService
-from src.core.yolo_loader import YoloModelLoader
 from src.config.yolo_config import YoloConfig
-from src.config.app_config import AppConfig
 from src.core.database_manager import DatabaseManager
+from src.core.mqtt_manager import MqttManager
+from src.core.yolo_loader import YoloModelLoader
 from src.services.auth_service import AuthService
 from src.services.camera_service import CameraService
-from src.services.scanner_service import ScannerService 
+from src.services.mqtt_service import MqttService
+from src.services.scanner_service import ScannerService
+from src.services.yolo_service import YoloService
 from src.ui.router import Router
 from src.utils.logger_config import setup_logging
-from src.utils.ui_helpers import UiHelper
 
 # Configuración global del Logger
 setup_logging()

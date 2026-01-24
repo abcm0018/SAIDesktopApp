@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 import logging
-from typing import Dict
+from typing import Any, Dict
 
 from src.core.mqtt_manager import MqttManager
 from src.domain.palet import PaletScanData
@@ -73,6 +73,45 @@ class MqttService:
         except Exception as e:
             logger.exception(f"Error crítico enviando datos de palet: {e}")
             return False
+        
+        
+    def send_scan_incident(self, partial_data: PaletScanData) -> bool:
+        """
+        Sends a report about a damaged or incomplete label scan.
+        Ensures all fields are present, filling missing ones with 'NO DATA'.
+        """
+        try:
+            # Helper local para limpiar nulos/vacíos
+            def _sanitize(value: Any) -> str:
+                if value is None:
+                    return "NO DATA"
+                str_val = str(value).strip()
+                return str_val if str_val else "NO DATA"
+
+            # Construimos el payload completo, sin huecos
+            payload = {
+                "event_type": "DAMAGED_LABEL_TIMEOUT",
+                "timestamp": datetime.now().isoformat(),
+                "device_id": "CAMERA_01", # Opcional: si tienes config de ID
+                "captured_data": {
+                    "sscc": _sanitize(partial_data.sscc),
+                    "ean": _sanitize(partial_data.ean),
+                    "batch_number": _sanitize(partial_data.batch_number),
+                    "expiration_date": _sanitize(partial_data.product_use_by_date),
+                    "packaging_date": _sanitize(partial_data.packaging_date),
+                    "production_time": _sanitize(partial_data.production_time)
+                }
+            }
+
+            logger.warning(f"Reporting incident to MQTT: {json.dumps(payload)}")
+            
+            target_topic = self.mqtt_manager.config.error_topic
+            return self.mqtt_manager.publish(target_topic, payload)
+
+        except Exception as e:
+            logger.error(f"Failed to send incident report: {e}")
+            return False
+        
 
     def _build_payload(self, palet_data: PaletScanData, employee_number: str) -> Dict:
         """

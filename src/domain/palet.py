@@ -17,10 +17,14 @@ class PaletScanData:
     
     # Metadatos de control
     ultimo_update: datetime = field(default_factory=datetime.now)
+    
+    # Campo de metadatos adicional (no serializado)
+    scan_start_time: Optional[datetime] = None
 
     def is_complete(self) -> bool:
         """
         Define si el palet tiene la información mínima necesaria.
+        Valida que los campos obligatorios no sean None.
         """
         campos_obligatorios = [
             self.sscc, 
@@ -30,13 +34,34 @@ class PaletScanData:
             # self.production_time # Descomentar si la hora es crítica
         ]
         # Verificamos que ninguno sea None
-        return all(v is not None for v in campos_obligatorios)
+        return all(v and str(v).strip() for v in campos_obligatorios)
+    
+    def init_timeout(self):
+        """
+        Fija el tiempo de inicio de la lectura si no está ya fijado.
+        """
+        if self.scan_start_time is None:
+            self.scan_start_time = datetime.now()
+    
+    def has_timed_out(self, timeout_seconds: float) -> bool:
+        """
+        Devuelve True si ha pasado el tiempo límite desde el primer dato detectado.
+        """
+        if self.scan_start_time is None:
+            return False
+        
+        delta = datetime.now() - self.scan_start_time
+        return delta.total_seconds() > timeout_seconds
 
     def actualizar_datos(self, datos_parser: Dict[str, Any]):
         """
         Ingesta datos provenientes del GS1Parser y actualiza los campos.
         """
         self.ultimo_update = datetime.now()
+        
+        # Si la primera vez que recibimos datos (y hay otros), fijamos el tiempo de inicio
+        if self.scan_start_time is None and datos_parser:
+            self.scan_start_time = datetime.now()
 
         # MAPA DE TRADUCCIÓN: { "Clave_Parser": "Atributo_Clase" }
         mapping = {

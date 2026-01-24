@@ -4,6 +4,7 @@ import threading
 import time
 import flet as ft
 
+from src.config.app_config import AppConfig
 from src.services.auth_service import AuthService
 from src.services.camera_service import CameraService
 from src.services.yolo_service import YoloService
@@ -37,7 +38,7 @@ class DashboardView(ft.Column):
         
         # --- Estado interno ---
         self.expand = True 
-        self.escaneando = False 
+        self.is_scanning = True 
         self.animando_linea = False
         self.lectura_bloqueada = False # Se activa al completar un palet
         self.user = self.page.session.get("user")
@@ -107,7 +108,9 @@ class DashboardView(ft.Column):
     def _build_camera_panel(self) -> ft.Container:
         self.img_video = ft.Image(
             src_base64=PLACEHOLDER_IMG, 
-            fit=ft.ImageFit.CONTAIN,  
+            # CAMBIO 1: COVER hace que la imagen llene todo el contenedor.
+            # (Recortará un poco los laterales, pero elimina el hueco negro)
+            fit=ft.ImageFit.COVER,   
             border_radius=12, 
             gapless_playback=True, 
             expand=True
@@ -124,23 +127,35 @@ class DashboardView(ft.Column):
 
         stack = ft.Stack(
             expand=True,
+            # CAMBIO 2: Alineación central forzada para que video, 
+            # recuadro y línea de escaneo compartan el mismo centro.
+            alignment=ft.alignment.center, 
             controls=[
-                self.img_video,
+                # Capa 1: Video
                 ft.Container(
-                    expand=True,
-                    alignment=ft.alignment.center,
-                    content=ft.Container(
-                        width=450, 
-                        height=450,
-                        border=ft.border.all(2, ft.Colors.WHITE60), 
-                        border_radius=12
-                    )
+                    content=self.img_video,
+                    # Aseguramos que el contenedor del video también busque expandirse
+                    expand=True, 
+                    alignment=ft.alignment.center
                 ),
+                
+                # Capa 2: Recuadro ROI (El cuadrado blanco)
+                ft.Container(
+                    width=450, 
+                    height=450,
+                    border=ft.border.all(2, ft.Colors.WHITE60), 
+                    border_radius=12,
+                    alignment=ft.alignment.center # Asegura centrado interno
+                ),
+                
+                # Capa 3: Línea de escaneo
                 ft.Container(
                     alignment=ft.alignment.center, 
                     content=self.scan_line,
                     expand=True
                 ),
+                
+                # Capa 4: Switch (Este lo mantenemos abajo)
                 ft.Container(
                     alignment=ft.alignment.bottom_center, 
                     padding=20,
@@ -314,7 +329,7 @@ class DashboardView(ft.Column):
             self.frame_queue.queue.clear()
 
         # Reiniciamos el DTO
-        self.palet_acumulado = PaletScanData(sscc="") 
+        self.palet_acumulado = PaletScanData()
         
         # Reset visual
         self.txt_sscc.value = "---"
@@ -467,7 +482,37 @@ class DashboardView(ft.Column):
                     self._limpiar_datos()
             
             threading.Thread(target=_auto_limpiar, daemon=True).start()
+    
+    def _handle_scan_timeout(self):
+        """
+        Handles the timeout event when a label cannot be fully read.
+        Renamed from '_procesar_etiqueta_daniada' to English.
+        """
+        logger.warning(f"Scan Timeout ({AppConfig.READ_TIMEOUT_SEC}s). Reporting damaged label.")
 
+        # Send Incident Report (Async)
+        threading.Thread(
+            target=self.mqtt_service.send_scan_incident,
+            args=(self.palet_acumulado,),
+            daemon=True
+        ).start()
+
+        # Visual Feedback
+        self.txt_estado.value = "❌ ETIQUETA DAÑADA"
+        self.txt_estado.color = ft.Colors.RED_ACCENT_400
+        self.scan_line.bgcolor = ft.Colors.RED_ACCENT_400
+        self.update()
+
+        # Short delay and reset
+        time.sleep(2.0)
+        self._limpiar_datos()
+        
+        # Restore UI
+        self.txt_estado.value = "ESPERANDO NUEVA ETIQUETA"
+        self.txt_estado.color = ft.Colors.WHITE
+        self.scan_line.bgcolor = ft.Colors.BLUE_ACCENT
+        self.update()
+        
     # --------------------------------------------------------------------------
     # SECCIÓN 3: LOGICA DE HILOS
     # --------------------------------------------------------------------------
@@ -509,15 +554,33 @@ class DashboardView(ft.Column):
         HILO CONSUMIDOR: Velocidad Variable.
         Recibe frames de la cola y ejecuta la IA pesada (YOLO + Scanner).
         """
-        while self.escaneando:
+        while self.is_scanning:
             try:
                 frame = self.frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
 
             try:
-                # A. Detección (YOLO)
+                # WATCHDOG DE TIMEOUT (FAIL FAST)
+                if (self.palet_acumulado.scan_start_time is not None
+                    and self.palet_acumulado.has_timed_out(AppConfig.READ_TIMEOUT_SEC)):
+                    
+                    logger.warning(f"Tiempo de lectura agotado para palet SSCC: {self.palet_acumulado.sscc}")
+                    
+                    # Ejecutamos la lógica de error (UI roja + MQTT reporte))
+                    self._handle_scan_timeout()
+                    
+                    # Clear the queue to skip pending frames
+                    with self.frame_queue.mutex:
+                        self.frame_queue.queue.clear()
+                        
+                    continue
+                
+                # A. Detection (YOLO)
                 rois_detectados = self.yolo_service.detectar(frame)
+                
+                if rois_detectados is None or len(rois_detectados) > 0:
+                    self.palet_acumulado.init_timeout()
                 
                 # B. Decodificación (Zxing + GS1)
                 scan_result_dto = self.scanner_service.procesar_zonas(frame, rois_detectados)

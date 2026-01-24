@@ -12,7 +12,8 @@ class MqttConfig:
     
     broker: str
     port: int
-    topic: str
+    topic: str # Canal MQTT para publicación de datos de palets
+    error_topic: str # Canal MQTT para reportar incidencias y lecturas fallidas
     client_id: str
     user: Optional[str] = None
     password: Optional[str] = None
@@ -38,6 +39,7 @@ class MqttConfig:
             broker=os.getenv("MQTT_BROKER", "localhost"),
             port=int(os.getenv("MQTT_PORT", "1883")),
             topic=os.getenv("MQTT_TOPIC", "inventario/palets/escaneados"),
+            error_topic=os.getenv("MQTT_TOPIC_ERRORS", "inventario/palets/incidencias"),
             client_id=os.getenv("MQTT_CLIENT_ID", "python_scanner_client"),
             user=os.getenv("MQTT_USER") or None,
             password=os.getenv("MQTT_PASSWORD") or None,
