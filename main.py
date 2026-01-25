@@ -1,5 +1,6 @@
 import asyncio  # Necesario para la carga asíncrona
 import logging
+import os
 
 import flet as ft
 
@@ -98,8 +99,15 @@ async def main(page: ft.Page):
         loading_text.value = "Finalizando configuración..."
         page.update()
 
+        # Leer configuración de cámaras
+        master_camera_id = int(os.getenv("MASTER_CAMERA_ID", 0))
+        slave_env = os.getenv("SLAVE_CAMERA_ID")
+        slave_camera_id = int(slave_env) if slave_env else None
+
+        logger.info(f"Configuración de Cámaras -> Master: {master_camera_id} | Backup: {slave_camera_id}")
+
         auth_service = AuthService(db_manager=db_manager)
-        camera_service = CameraService()
+        camera_service = CameraService(camera_id=master_camera_id, backup_id=slave_camera_id)
         scanner_service = ScannerService()
         
         # Inyectamos el manager en el servicio (según tu refactorización)

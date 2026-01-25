@@ -154,6 +154,9 @@ class DashboardView(ft.Column):
                     content=self.scan_line,
                     expand=True
                 ),
+
+                # Indicador de tipo de cámara
+                ft.Container(content=self._build_camera_status(), alignment=ft.alignment.top_right, padding=20),
                 
                 # Capa 4: Switch (Este lo mantenemos abajo)
                 ft.Container(
@@ -199,6 +202,8 @@ class DashboardView(ft.Column):
         self.txt_fechas = ft.Text("Caducidad: -", size=12, color=ft.Colors.GREY_600)
         self.txt_produccion = ft.Text("Prod: -", size=12, color=ft.Colors.GREY_600)
 
+        self.txt_envio_msg = ft.Text("Enviando datos...", color=ft.Colors.BLUE_700)
+
         self.info_container = ft.Column(
             opacity=0.3,
             animate_opacity=300,
@@ -222,7 +227,7 @@ class DashboardView(ft.Column):
             content=ft.Row(
                 controls=[
                     ft.ProgressRing(width=20, height=20, stroke_width=2),
-                    ft.Text("Enviando datos...", color=ft.Colors.BLUE_700)
+                    self.txt_envio_msg
                 ],
                 spacing=10,
                 alignment=ft.MainAxisAlignment.CENTER
@@ -261,17 +266,44 @@ class DashboardView(ft.Column):
             content=content
         )
 
+    def _build_camera_status(self):
+        """
+        Construye el indicador de estado de la cámara (Master/Slave)
+        Define los controles con atributos de clase para poder actualizarlos
+        """
+        self.icon_cam_status = ft.Icon(name=ft.Icons.VIDEOCAM_OFF, color=ft.Colors.GREY_500)
+        self.txt_cam_status = ft.Text(
+            value="PAUSA",
+            color=ft.Colors.GREY_500,
+            weight=ft.FontWeight.BOLD,
+            size=12
+        )
+
+        return ft.Container(
+            content=ft.Row(
+                controls=[self.icon_cam_status, self.txt_cam_status],
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=5,
+                tight=True
+            ),
+            bgcolor=ft.Colors.BLACK54,
+            padding=ft.padding.symmetric(horizontal=8, vertical=4),
+            border_radius=5,
+        )
+
     # --------------------------------------------------------------------------
     # SECCIÓN 2: CONTROL DE FLUJO Y EVENTOS
     # --------------------------------------------------------------------------
 
     def _toggle_camara(self, e):
-        if e.control.value: 
+        activar = e.control.value
+        if activar:
             self._iniciar_flujo_camara()
         else: 
             self._detener_flujo_camara()
 
     def _logout(self, e):
+        logger.debug(f"Evento de cierre de sessión: {e}")
         self._detener_flujo_camara()
         
         try:
@@ -294,7 +326,23 @@ class DashboardView(ft.Column):
         self.escaneando = True
         self.animando_linea = True
         self.lectura_bloqueada = False
-        
+
+        if self.camera_service.using_backup:
+            # Estado: SLAVE (Naranja)
+            self.txt_cam_status.value = "SLAVE (BACKUP)"
+            self.txt_cam_status.color = ft.Colors.ORANGE
+            self.icon_cam_status.name = ft.Icons.WARNING_AMBER_ROUNDED
+            self.icon_cam_status.color = ft.Colors.ORANGE
+        else:
+            # Estado: MASTER (verde)
+            self.txt_cam_status.value = "MASTER"
+            self.txt_cam_status.color = ft.Colors.GREEN
+            self.icon_cam_status.name = ft.Icons.VIDEOCAM
+            self.icon_cam_status.color = ft.Colors.GREEN
+
+        self.txt_cam_status.update()
+        self.icon_cam_status.update()
+
         # Limpiar la cola por si había basura
         with self.frame_queue.mutex:
             self.frame_queue.queue.clear()
@@ -313,7 +361,14 @@ class DashboardView(ft.Column):
         self.escaneando = False
         self.animando_linea = False
         self.camera_service.detener_camara()
-        
+
+        # Actualización icono estado cámara
+        self.txt_cam_status.value = "PAUSA"
+        self.txt_cam_status.color = ft.Colors.GREY_500
+        self.icon_cam_status.name = ft.Icons.VIDEOCAM_OFF
+        self.icon_cam_status.color = ft.Colors.GREY_500
+        self.txt_cam_status.update()
+        self.icon_cam_status.update()
         # Limpiamos imagen
         self.img_video.src_base64 = PLACEHOLDER_IMG
         self.img_video.update()
@@ -393,8 +448,8 @@ class DashboardView(ft.Column):
         
         try:
             self.mqtt_status_icon.update()
-        except Exception:
-            pass  # Puede fallar si el widget no está montado
+        except Exception as e:
+            logger.warning(f"Error actualizando icono MQTT: {e}")
 
     def _enviar_palet_mqtt(self):
         """
@@ -405,7 +460,7 @@ class DashboardView(ft.Column):
             try:
                 # Mostrar indicador de envío
                 self.envio_status.visible = True
-                self.envio_status.content.controls[1].value = "Enviando datos..."
+                self.txt_envio_msg.value = "Enviando datos..."
                 self.envio_status.update()
 
                 # Obtener employee_number del usuario
@@ -567,7 +622,7 @@ class DashboardView(ft.Column):
                     
                     logger.warning(f"Tiempo de lectura agotado para palet SSCC: {self.palet_acumulado.sscc}")
                     
-                    # Ejecutamos la lógica de error (UI roja + MQTT reporte))
+                    # Ejecutamos la lógica de error (UI roja + MQTT reporte)
                     self._handle_scan_timeout()
                     
                     # Clear the queue to skip pending frames
@@ -678,7 +733,8 @@ class DashboardView(ft.Column):
             self.scan_line.offset = nuevo_offset
             try:
                 self.scan_line.update()
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Animación detenida (UI no accesible): {e}")
                 break 
             
             direccion_abajo = not direccion_abajo
