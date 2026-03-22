@@ -4,6 +4,7 @@ import threading
 import time
 import flet as ft
 
+from services.audit_service import AuditService
 from src.config.app_config import AppConfig
 from src.services.auth_service import AuthService
 from src.services.camera_service import CameraService
@@ -26,7 +27,8 @@ class DashboardView(ft.Column):
         camera_service: CameraService, 
         yolo_service: YoloService,
         scanner_service: ScannerService,
-        mqtt_service: MqttService
+        mqtt_service: MqttService,
+        audit_service: AuditService
     ):
         super().__init__()
         self.page = page
@@ -34,7 +36,8 @@ class DashboardView(ft.Column):
         self.camera_service = camera_service
         self.yolo_service = yolo_service
         self.scanner_service = scanner_service
-        self.mqtt_service = mqtt_service 
+        self.mqtt_service = mqtt_service
+        self.audit_service = audit_service
         
         # --- Estado interno ---
         self.expand = True 
@@ -540,15 +543,16 @@ class DashboardView(ft.Column):
     
     def _handle_scan_timeout(self):
         """
-        Handles the timeout event when a label cannot be fully read.
-        Renamed from '_procesar_etiqueta_daniada' to English.
+        Maneja el caso donde se detecta un palet pero no se decodifica tras X segundos.
+        Se asume etiqueta dañada y se registra en Base de Datos.
         """
         logger.warning(f"Scan Timeout ({AppConfig.READ_TIMEOUT_SEC}s). Reporting damaged label.")
 
-        # Send Incident Report (Async)
+        # Registrar en Base de Datos (Auditoría)
+        employee_number = getattr(self.user, 'employee_number', 'UNKNOWN')
         threading.Thread(
-            target=self.mqtt_service.send_scan_incident,
-            args=(self.palet_acumulado,),
+            target=self.audit_service.registrar_incidencia,
+            args=(employee_number, self.palet_acumulado, "TIMEOUT_ETIQUETA_DAÑADA"),
             daemon=True
         ).start()
 
@@ -593,7 +597,7 @@ class DashboardView(ft.Column):
             
             if frame_b64:
                 self.img_video.src_base64 = frame_b64
-                self.img_video.update()
+                self.page.update()
 
             # Enviar a Cola de IA (Strategy: Drop Frame)
             if not self.lectura_bloqueada:

@@ -4,6 +4,7 @@ import os
 
 import flet as ft
 
+from services.audit_service import AuditService
 from src.config.app_config import AppConfig
 from src.config.mqtt_config import MqttConfig
 from src.config.routes import AppRoutes
@@ -107,6 +108,7 @@ async def main(page: ft.Page):
         logger.info(f"Configuración de Cámaras -> Master: {master_camera_id} | Backup: {slave_camera_id}")
 
         auth_service = AuthService(db_manager=db_manager)
+        audit_service = AuditService(db_manager=db_manager)
         camera_service = CameraService(camera_id=master_camera_id, backup_id=slave_camera_id)
         scanner_service = ScannerService()
         
@@ -134,7 +136,8 @@ async def main(page: ft.Page):
             camera_service=camera_service, 
             scanner_service=scanner_service,
             yolo_service=yolo_service,
-            mqtt_service=mqtt_service
+            mqtt_service=mqtt_service,
+            audit_service=audit_service
         )
         
         page.on_route_change = my_router.route_change

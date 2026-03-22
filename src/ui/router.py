@@ -2,6 +2,7 @@ import logging
 import flet as ft
 from typing import Callable, Dict
 
+from services.audit_service import AuditService
 from src.services.mqtt_service import MqttService
 from src.services.yolo_service import YoloService
 from src.config.routes import AppRoutes
@@ -26,7 +27,8 @@ class Router:
         camera_service: CameraService,
         scanner_service: ScannerService,
         mqtt_service: MqttService,
-        yolo_service: YoloService
+        yolo_service: YoloService,
+        audit_service: AuditService,
     ):
         self.page = page
         self.auth_service = auth_service
@@ -34,6 +36,7 @@ class Router:
         self.scanner_service = scanner_service
         self.yolo_service = yolo_service
         self.mqtt_service = mqtt_service
+        self.audit_service = audit_service
 
         # Definición de rutas y sus manejadores
         self.routes: Dict[str, Callable[[], ft.View]] = {
@@ -109,7 +112,8 @@ class Router:
                     camera_service=self.camera_service, 
                     scanner_service=self.scanner_service,
                     yolo_service=self.yolo_service,
-                    mqtt_service=self.mqtt_service
+                    mqtt_service=self.mqtt_service,
+                    audit_service=self.audit_service
                 )
             ],
             vertical_alignment=ft.MainAxisAlignment.START,
