@@ -11,6 +11,7 @@ from src.services.camera_service import CameraService
 from src.services.scanner_service import ScannerService
 from src.ui.views.dashboard_view import DashboardView
 from src.ui.views.login_view import LoginView
+from src.ui import design_system as ds
 
 logger = logging.getLogger(__name__)
 
@@ -95,11 +96,10 @@ class Router:
     def _login_view(self) -> ft.View:
         return ft.View(
             route=AppRoutes.LOGIN,
-            controls=[
-                LoginView(self.page, auth_service=self.auth_service)
-            ],
-            vertical_alignment=ft.MainAxisAlignment.CENTER,
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER
+            controls=[LoginView(self.page, auth_service=self.auth_service)],
+            padding=0,
+            vertical_alignment=ft.MainAxisAlignment.START,
+            horizontal_alignment=ft.CrossAxisAlignment.START,
         )
 
     def _dashboard_view(self) -> ft.View:
@@ -108,8 +108,8 @@ class Router:
             controls=[
                 DashboardView(
                     page=self.page,
-                    auth_service=self.auth_service, 
-                    camera_service=self.camera_service, 
+                    auth_service=self.auth_service,
+                    camera_service=self.camera_service,
                     scanner_service=self.scanner_service,
                     yolo_service=self.yolo_service,
                     mqtt_service=self.mqtt_service,
@@ -118,5 +118,6 @@ class Router:
             ],
             vertical_alignment=ft.MainAxisAlignment.START,
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            padding=0
+            bgcolor=ds.SURFACE_BASE,
+            padding=0,
         )

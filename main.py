@@ -3,11 +3,13 @@ import logging
 import os
 
 import flet as ft
+from dotenv import load_dotenv
 
 from services.audit_service import AuditService
 from src.config.app_config import AppConfig
 from src.config.mqtt_config import MqttConfig
 from src.config.routes import AppRoutes
+from src.ui import design_system as ds
 from src.config.yolo_config import YoloConfig
 from src.core.database_manager import DatabaseManager
 from src.core.mqtt_manager import MqttManager
@@ -24,6 +26,9 @@ from src.utils.logger_config import setup_logging
 setup_logging()
 logger = logging.getLogger(__name__)
 
+# Cargamos las variables de entorno desde el archivo .env UNA SOLA VEZ
+load_dotenv()
+
 async def main(page: ft.Page):
     logger.info("Iniciando aplicación (SAI)...")
    
@@ -32,30 +37,92 @@ async def main(page: ft.Page):
     page.theme_mode = ft.ThemeMode.LIGHT
     page.window.full_screen = False
     page.window.maximized = True
+    page.window.min_width = 520
+    page.window.min_height = 620
     page.padding = 0
+
+    # 1.1: Leemos la configuración de la estación
+    station_code = os.getenv("STATION_CODE", "PUESTO_NO_CONFIGURADO")
+    station_camera_id = os.getenv("STATION_CAMERA_ID", "CAM-UNKNOWN")
+
+    logger.info(f"Contexto cargado -> Puesto: {station_code} | Cámara: {station_camera_id}")
+
+    # Añadimos la configuración en la sesión global de Flet
+    page.session.set("station_code", station_code)
+    page.session.set("camera_id", station_camera_id)
     
     # 2. PANTALLA DE CARGA (Splash Screen)
-    # Creamos componentes visuales para feedback inmediato
-    loading_text = ft.Text("Iniciando servicios del sistema...", size=16, color=ft.Colors.GREY_700)
-    loading_bar = ft.ProgressBar(width=400, color=ft.Colors.BLUE_700, bgcolor=ft.Colors.BLUE_100)
-    
-    splash_content = ft.Container(
-        content=ft.Column(
-            controls=[
-                ft.Image(src="assets/logo.png", width=150, error_content=ft.Icon(ft.Icons.APPS_ROUNDED, size=100)),
-                ft.Container(height=20),
-                ft.ProgressRing(width=50, height=50, stroke_width=4),
-                ft.Container(height=20),
-                loading_text,
-                ft.Container(height=10),
-                loading_bar
-            ],
-            alignment=ft.MainAxisAlignment.CENTER,
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER
+    loading_text = ft.Text(
+        "Iniciando servicios del sistema...",
+        size=ds.SIZE_LABEL,
+        color=ds.TEXT_SECONDARY,
+    )
+    loading_bar = ft.ProgressBar(
+        width=300,
+        color=ds.ACCENT_BLUE,
+        bgcolor=ds.SURFACE_ELEVATED,
+    )
+
+    logo_box = ft.Container(
+        content=ft.Image(
+            src="assets/logo.png",
+            width=64,
+            error_content=ft.Icon(ft.Icons.INVENTORY_2_ROUNDED, size=48, color=ft.Colors.WHITE),
         ),
+        width=100,
+        height=100,
+        border_radius=24,
+        bgcolor=ds.SURFACE_ELEVATED,
         alignment=ft.alignment.center,
+        shadow=ft.BoxShadow(
+            spread_radius=0,
+            blur_radius=24,
+            color=ft.Colors.with_opacity(0.45, ft.Colors.BLUE_600),
+            offset=ft.Offset(0, 8),
+        ),
+    )
+
+    splash_content = ft.Stack(
         expand=True,
-        bgcolor=ft.Colors.WHITE
+        controls=[
+            ft.Container(
+                expand=True,
+                gradient=ft.LinearGradient(
+                    begin=ft.alignment.top_left,
+                    end=ft.alignment.bottom_right,
+                    colors=[ds.BG_GRADIENT_START, ds.BG_GRADIENT_END],
+                ),
+            ),
+            ft.Container(
+                width=300, height=300, border_radius=150,
+                bgcolor=ft.Colors.with_opacity(0.04, ft.Colors.WHITE),
+                right=-80, top=-80,
+            ),
+            ft.Container(
+                expand=True,
+                alignment=ft.alignment.center,
+                content=ft.Column(
+                    controls=[
+                        logo_box,
+                        ft.Container(height=20),
+                        ft.Text("SAI", size=32, weight=ft.FontWeight.BOLD, color=ds.TEXT_PRIMARY),
+                        ft.Text(
+                            AppConfig.APP_TITLE,
+                            size=ds.SIZE_CAPTION,
+                            color=ds.TEXT_SECONDARY,
+                            text_align=ft.TextAlign.CENTER,
+                        ),
+                        ft.Container(height=28),
+                        loading_bar,
+                        ft.Container(height=10),
+                        loading_text,
+                    ],
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    tight=True,
+                ),
+            ),
+        ],
     )
 
     # Añadimos y actualizamos YA para que el usuario vea algo
@@ -101,15 +168,11 @@ async def main(page: ft.Page):
         page.update()
 
         # Leer configuración de cámaras
-        master_camera_id = int(os.getenv("MASTER_CAMERA_ID", 0))
-        slave_env = os.getenv("SLAVE_CAMERA_ID")
-        slave_camera_id = int(slave_env) if slave_env else None
-
-        logger.info(f"Configuración de Cámaras -> Master: {master_camera_id} | Backup: {slave_camera_id}")
+        device_camera_id = int(os.getenv("DEVICE_CAMERA_ID", 0))
 
         auth_service = AuthService(db_manager=db_manager)
         audit_service = AuditService(db_manager=db_manager)
-        camera_service = CameraService(camera_id=master_camera_id, backup_id=slave_camera_id)
+        camera_service = CameraService(camera_id=device_camera_id)
         scanner_service = ScannerService()
         
         # Inyectamos el manager en el servicio (según tu refactorización)
@@ -117,7 +180,7 @@ async def main(page: ft.Page):
         
         yolo_service = YoloService(model=modelo_yolo, conf_threshold=yolo_config.conf_threshold)
 
-        logger.info("✅ Servicios del Core inicializados correctamente.")
+        logger.info("Servicios del Core inicializados correctamente.")
         
         # Pequeña pausa estética para que el usuario vea "Completado"
         loading_bar.value = 1
