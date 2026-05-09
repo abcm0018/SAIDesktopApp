@@ -32,21 +32,21 @@ class PaletScanData:
     def is_fully_captured(self) -> bool:
         """Indica si hemos capturado toda la información de la etiqueta. O(1) — flag cacheado."""
         return self._fully_captured
-    
+
     def init_timeout(self):
         """
         Fija el tiempo de inicio de la lectura si no está ya fijado.
         """
         if self.scan_start_time is None:
             self.scan_start_time = datetime.now()
-    
+
     def has_timed_out(self, timeout_seconds: float) -> bool:
         """
         Devuelve True si ha pasado el tiempo límite desde el primer dato detectado.
         """
         if self.scan_start_time is None:
             return False
-        
+
         delta = datetime.now() - self.scan_start_time
         return delta.total_seconds() > timeout_seconds
 
@@ -55,7 +55,7 @@ class PaletScanData:
         Ingesta datos provenientes del GS1Parser y actualiza los campos.
         """
         self.ultimo_update = datetime.now()
-        
+
         # Si la primera vez que recibimos datos (y hay otros), fijamos el tiempo de inicio
         if self.scan_start_time is None and datos_parser:
             self.scan_start_time = datetime.now()
@@ -66,13 +66,13 @@ class PaletScanData:
             "gtin": "ean",
             "batch": "batch_number",
             "best_before_date": "product_use_by_date",
-            "production_date": "packaging_date", 
+            "production_date": "packaging_date",
             "production_time": "production_time"
         }
 
         for key_parser, attr_class in mapping.items():
             valor_nuevo = datos_parser.get(key_parser)
-            
+
             # Solo actualizamos si el valor existe y el atributo actual es None
             # (o si quisieras lógica de sobrescritura, quitarías la condición 'is None')
             if valor_nuevo and getattr(self, attr_class) is None:

@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class MqttService:
     """
     Servicio de aplicación para publicación de datos de palets.
-    
+
     Responsabilidades:
     - Transformar objetos de dominio a formato JSON
     - Validar datos antes de enviar
@@ -32,7 +32,7 @@ class MqttService:
     def enviar_datos_palet(self, palet_data: PaletScanData, employee_number: str, station_code: str, station_cam_id: str) -> bool:
         """
         Envía los datos de un palet escaneado al sistema backend.
-        
+
         Args:
             palet_data: Datos del palet escaneado.
             employee_number: Número de empleado.
@@ -49,10 +49,10 @@ class MqttService:
         try:
             # Construir payload
             payload = self._build_payload(palet_data, employee_number, station_code, station_cam_id)
-            
+
             # Serializar a JSON
             json_payload = json.dumps(payload, ensure_ascii=False, indent=None)
-            
+
             # Enviar a través del gestor MQTT
             enviado = self.mqtt_manager.publish_message(payload=json_payload)
 
@@ -69,8 +69,8 @@ class MqttService:
         except Exception as e:
             logger.exception(f"Error crítico enviando datos de palet: {e}")
             return False
-        
-        
+
+
     def send_scan_incident(self, partial_data: PaletScanData) -> bool:
         """
         Sends a report about a damaged or incomplete label scan.
@@ -88,7 +88,7 @@ class MqttService:
             payload = {
                 "event_type": "DAMAGED_LABEL_TIMEOUT",
                 "timestamp": datetime.now().isoformat(),
-                "device_id": "CAMERA_01", # Opcional: si tienes config de ID
+                "device_id": "CAMERA_01",
                 "captured_data": {
                     "sscc": _sanitize(partial_data.sscc),
                     "ean": _sanitize(partial_data.ean),
@@ -100,14 +100,14 @@ class MqttService:
             }
 
             logger.warning(f"Reporting incident to MQTT: {json.dumps(payload)}")
-            
+
             target_topic = self.mqtt_manager.config.error_topic
             return self.mqtt_manager.publish(target_topic, payload)
 
         except Exception as e:
             logger.error(f"Failed to send incident report: {e}")
             return False
-        
+
 
     @staticmethod
     def _build_payload(palet_data: PaletScanData, employee_number: str, station_code: str, station_cam_id: str) -> Dict:
@@ -116,13 +116,6 @@ class MqttService:
 
         NOTA: Asume que palet_data tiene fechas en formato UI (DD/MM/YYYY).
         Las transforma a formato ISO (YYYY-MM-DD) para el backend Java.
-
-        Args:
-            palet_data: Datos del palet.
-            employee_number: Número de empleado.
-
-        Returns:
-            Diccionario con el payload formateado.
         """
         # Transformar fechas de formato UI a ISO
         iso_use_by_date = DateTimeFormatter.ui_date_to_iso(palet_data.product_use_by_date)
