@@ -1,235 +1,733 @@
 import logging
+import queue
 import threading
 import time
 import flet as ft
+
+from src.services.audit_service import AuditService
+from src.config.app_config import AppConfig
 from src.services.auth_service import AuthService
 from src.services.camera_service import CameraService
+from src.services.yolo_service import YoloService
+from src.services.scanner_service import ScannerService
+from src.services.mqtt_service import MqttService
+from src.domain.palet import PaletScanData
+from src.config.routes import AppRoutes
+from src.ui import design_system as ds
 
 logger = logging.getLogger(__name__)
 
-# Un pixel gris en Base64 para inicializar la imagen sin errores
+# Imagen vacía (pixel transparente) para cuando la cámara está apagada
 PLACEHOLDER_IMG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 
+
 class DashboardView(ft.Column):
-    def __init__(self, page: ft.Page, auth_service: AuthService, camera_service: CameraService):
+    def __init__(
+            self,
+            page: ft.Page,
+            auth_service: AuthService,
+            camera_service: CameraService,
+            yolo_service: YoloService,
+            scanner_service: ScannerService,
+            mqtt_service: MqttService,
+            audit_service: AuditService
+    ):
         super().__init__()
         self.page = page
         self.auth_service = auth_service
         self.camera_service = camera_service
-        
-        self.expand = True 
-        self.escaneando = False 
-        self.animando_linea = False # Bandera para el bucle de animación
+        self.yolo_service = yolo_service
+        self.scanner_service = scanner_service
+        self.mqtt_service = mqtt_service
+        self.audit_service = audit_service
 
-        # --- 1. DATOS DEL USUARIO Y HEADER ---
-        self.user = self.page.session.get("usuario_sesion")
-        nombre_mostrar = "Usuario"
+        # --- Estado interno ---
+        self.station_code = self.page.session.get("station_code")
+        self.camera_id = self.page.session.get("camera_id")
+        self.user = self.page.session.get("user")
+
+        self.en_periodo_gracia = False
+        self.tiempo_inicio_gracia = 0
+        self.segundos_gracia = AppConfig.READ_TIMEOUT_SEC
+
+        self.expand = True
+        self.spacing = 0
+        self.escaneando = False      # Flag canónico: controla AMBOS hilos de fondo
+        self.animando_linea = False
+        self.lectura_bloqueada = False
+
+        self.palet_acumulado = PaletScanData()
+        self.frame_queue = queue.Queue(maxsize=1)
+
+        # --- Construcción de UI ---
+        self.header = self._build_header()
+        self.left_panel = self._build_camera_panel()
+        self.right_panel = self._build_info_panel()
+
+        self.controls = [
+            self.header,
+            ft.Row(
+                controls=[self.left_panel, self.right_panel],
+                expand=True,
+                spacing=0
+            )
+        ]
+
+    # --------------------------------------------------------------------------
+    # SECCIÓN 1: BUILDERS
+    # --------------------------------------------------------------------------
+
+    def _build_header(self) -> ft.Container:
+        nombre_mostrar = "Operador"
         if self.user:
             nombre = getattr(self.user, 'name', '') or ''
             apellido = getattr(self.user, 'surname', '') or ''
-            full_name = f"{nombre} {apellido}".strip()
-            nombre_mostrar = full_name if full_name else self.user.employee_number
+            nombre_mostrar = f"{nombre} {apellido}".strip() or self.user.employee_number
 
-        self.header = ft.Container(
-            padding=ft.padding.symmetric(horizontal=20, vertical=15),
-            content=ft.Row(
-                controls=[
-                    ft.Text(f"Hola, {nombre_mostrar}", size=22, weight=ft.FontWeight.BOLD, color=ft.Colors.GREY_800),
-                    ft.IconButton(icon=ft.Icons.LOGOUT_ROUNDED, tooltip="Cerrar Sesión", icon_size=26, icon_color=ft.Colors.RED_400, on_click=self._logout)
-                ],
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                vertical_alignment=ft.CrossAxisAlignment.CENTER 
-            )
+        self.txt_subtitle = ft.Text(
+            f"Puesto: {self.station_code} | Cámara: {self.camera_id}",
+            size=14,
+            color=ds.TEXT_SECONDARY,
         )
 
-        # --- 2. COMPONENTES DEL ESCÁNER ---
-        
-        # A. La imagen del video
-        self.img_video = ft.Image(
-            src_base64=PLACEHOLDER_IMG, 
-            width=640, 
-            height=480,
-            fit=ft.ImageFit.COVER,
-            border_radius=12,
-            gapless_playback=True 
+        self.mqtt_status_icon = ft.Icon(
+            ft.Icons.CLOUD_OFF,
+            color=ds.TEXT_MUTED,
+            size=20,
+            tooltip="MQTT desconectado"
         )
 
-        # B. La línea de escaneo roja
-        self.scan_line = ft.Container(
-            width=280,
-            height=2,
-            bgcolor=ft.Colors.RED_ACCENT_400,
-            shadow=ft.BoxShadow(blur_radius=5, color=ft.Colors.RED_ACCENT_400),
-            
-            # --- CORRECCIÓN 1: ft.Offset en lugar de ft.transform.Offset ---
-            offset=ft.Offset(0, -1.2), 
-            
-            # --- CORRECCIÓN 2: ft.Animation en lugar de ft.animation.Animation ---
-            animate_offset=ft.Animation(duration=1500, curve=ft.AnimationCurve.EASE_IN_OUT)
-        )
-
-        # C. Construcción del Stack
-        self.scanner_stack = ft.Stack(
-            width=640,
-            height=480,
+        return ft.Column(
             controls=[
-                self.img_video,
-                # Overlay oscuro
                 ft.Container(
-                    alignment=ft.alignment.center,
-                    content=ft.Container(
-                        width=250, 
-                        height=250,
-                        border=ft.border.all(2, ft.Colors.WHITE54),
-                        border_radius=12,
-                        shadow=ft.BoxShadow(
-                            spread_radius=1000, 
-                            color=ft.Colors.with_opacity(0.5, ft.Colors.BLACK), 
-                            offset=ft.Offset(0,0),
-                            blur_style=ft.ShadowBlurStyle.SOLID
-                        )
+                    padding=ft.padding.symmetric(horizontal=20, vertical=14),
+                    bgcolor=ds.SURFACE_ELEVATED,
+                    content=ft.Row(
+                        controls=[
+                            ft.Column([
+                                ft.Text(
+                                    f"Operador: {nombre_mostrar}",
+                                    size=14,
+                                    weight=ft.FontWeight.BOLD,
+                                    color=ds.TEXT_PRIMARY,
+                                ),
+                                self.txt_subtitle,
+                            ], spacing=2),
+                            ft.Row([
+                                self.mqtt_status_icon,
+                                ft.IconButton(
+                                    icon=ft.Icons.LOGOUT_ROUNDED,
+                                    tooltip="Cerrar Sesión",
+                                    icon_color=ds.ACCENT_RED,
+                                    on_click=self._logout
+                                )
+                            ], spacing=5)
+                        ],
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     )
                 ),
-                # Línea animada
+                ft.Container(height=1, bgcolor=ds.BORDER_ACCENT),
+            ],
+            spacing=0,
+        )
+
+    def _build_camera_panel(self) -> ft.Container:
+        self.img_video = ft.Image(
+            src_base64=PLACEHOLDER_IMG,
+            fit=ft.ImageFit.COVER,
+            border_radius=12,
+            gapless_playback=True,
+            expand=True
+        )
+
+        self.scan_line = ft.Container(
+            width=3,
+            height=450,
+            bgcolor=ds.ACCENT_BLUE,
+            shadow=ft.BoxShadow(blur_radius=10, color=ds.ACCENT_BLUE),
+            offset=ft.Offset(-1.2, 0),
+            animate_offset=ft.Animation(duration=1500, curve=ft.AnimationCurve.EASE_IN_OUT),
+        )
+
+        stack = ft.Stack(
+            expand=True,
+            alignment=ft.alignment.center,
+            controls=[
+                ft.Container(
+                    content=self.img_video,
+                    expand=True,
+                    alignment=ft.alignment.center
+                ),
+                ft.Container(
+                    width=450,
+                    height=450,
+                    border=ft.border.all(2, ft.Colors.WHITE60),
+                    border_radius=12,
+                    alignment=ft.alignment.center
+                ),
                 ft.Container(
                     alignment=ft.alignment.center,
-                    content=self.scan_line
+                    content=self.scan_line,
+                    expand=True
+                ),
+                ft.Container(content=self._build_camera_status(), alignment=ft.alignment.top_right, padding=20),
+                ft.Container(
+                    alignment=ft.alignment.bottom_center,
+                    padding=20,
+                    content=ft.Switch(
+                        label="Activar puesto",
+                        label_style=ft.TextStyle(color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
+                        value=False,
+                        active_color=ds.ACCENT_GREEN,
+                        on_change=self._toggle_camara
+                    )
                 )
             ]
         )
 
-        # D. Header diálogo
-        header_dialogo = ft.Row(
+        return ft.Container(
+            expand=1,
+            margin=5,
+            border_radius=15,
+            bgcolor=ds.SURFACE_BASE,
+            clip_behavior=ft.ClipBehavior.HARD_EDGE,
+            content=stack
+        )
+
+    def _build_info_panel(self) -> ft.Container:
+        self.txt_estado = ft.Text(
+            "Cámara apagada",
+            color=ds.TEXT_MUTED,
+            weight=ft.FontWeight.BOLD,
+        )
+
+        self.txt_sscc = ft.Text(
+            "---",
+            size=ds.SIZE_DATA_XL,
+            weight=ft.FontWeight.BOLD,
+            color=ds.ACCENT_BLUE,
+            text_align=ft.TextAlign.CENTER,
+        )
+
+        self.txt_producto = ft.Text("EAN: -", size=ds.SIZE_DATA_LG, color=ds.TEXT_PRIMARY)
+        self.txt_lote = ft.Text("Lote: -", size=ds.SIZE_LABEL, color=ds.TEXT_SECONDARY)
+        self.txt_fechas = ft.Text("Caducidad: -", size=ds.SIZE_LABEL, color=ds.TEXT_SECONDARY)
+        self.txt_produccion = ft.Text("Prod: -", size=ds.SIZE_LABEL, color=ds.TEXT_SECONDARY)
+
+        self.txt_envio_msg = ft.Text("Enviando datos...", color=ds.TEXT_SECONDARY)
+
+        self.info_container = ft.Column(
+            opacity=0.3,
+            animate_opacity=300,
             controls=[
-                ft.IconButton(ft.Icons.CLOSE, on_click=self._cerrar_modal_camara, icon_color=ft.Colors.GREY_600),
-                ft.Container(
-                    padding=ft.padding.symmetric(horizontal=12, vertical=6),
-                    bgcolor=ft.Colors.GREEN_50,
-                    border_radius=20,
-                    content=ft.Row([
-                        ft.Icon(ft.Icons.FIBER_MANUAL_RECORD, color=ft.Colors.GREEN, size=14),
-                        ft.Text("Cámara Activa", color=ft.Colors.GREEN_800, size=12, weight=ft.FontWeight.BOLD)
-                    ], spacing=5)
-                )
-            ],
-            alignment=ft.MainAxisAlignment.SPACE_BETWEEN
+                ft.Text("SSCC (Matrícula):", size=10, color=ds.TEXT_MUTED),
+                self.txt_sscc,
+                ft.Divider(height=10, color=ft.Colors.TRANSPARENT),
+                self.txt_producto,
+                self.txt_lote,
+                self.txt_fechas,
+                self.txt_produccion
+            ]
         )
 
-        # E. Footer diálogo
-        footer_dialogo = ft.Column(
-            controls=[
-                ft.Text("Escanea el código QR del palet", weight=ft.FontWeight.BOLD, size=16, text_align=ft.TextAlign.CENTER),
-                ft.Text("Sitúa el código dentro del marco cuadrado para procesarlo.", color=ft.Colors.GREY_600, size=12, text_align=ft.TextAlign.CENTER)
-            ],
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            spacing=5
-        )
-
-        # F. Diálogo final
-        self.dlg_escaner = ft.AlertDialog(
-            modal=True,
-            title_padding=0,
-            content_padding=ft.padding.all(20),
-            actions_padding=0,
-            shape=ft.RoundedRectangleBorder(radius=16),
-            content=ft.Container(
-                width=650,
-                content=ft.Column(
-                    controls=[
-                        header_dialogo,
-                        ft.Divider(height=20, color=ft.Colors.TRANSPARENT),
-                        self.scanner_stack,
-                        ft.Divider(height=20, color=ft.Colors.TRANSPARENT),
-                        footer_dialogo
-                    ],
-                    tight=True,
-                    horizontal_alignment=ft.CrossAxisAlignment.CENTER
-                )
-            ),
-            on_dismiss=lambda e: self._cerrar_modal_camara(None) 
-        )
-
-        # --- 3. BOTÓN PRINCIPAL ---
-        try:
-            tiene_camara = self.camera_service.verificar_disponibilidad()
-        except Exception as e:
-            logger.error(f"Error checking camera: {e}")
-            tiene_camara = False
-            
-        color_fondo = ft.Colors.BLUE_600 if tiene_camara else ft.Colors.GREY_400
-        
-        self.scan_button = ft.Container(
-            width=280, height=280,
-            bgcolor=color_fondo, border_radius=30, disabled=not tiene_camara,
-            shadow=ft.BoxShadow(spread_radius=1, blur_radius=15, color=ft.Colors.BLUE_200 if tiene_camara else ft.Colors.GREY_300, offset=ft.Offset(0, 5)),
-            on_click=self._abrir_modal_camara,
-            content=ft.Column(
+        self.envio_status = ft.Container(
+            visible=False,
+            animate_opacity=300,
+            padding=15,
+            border_radius=ds.RADIUS_MD,
+            bgcolor=ds.SURFACE_ELEVATED,
+            content=ft.Row(
                 controls=[
-                    ft.Icon(ft.Icons.QR_CODE_SCANNER if tiene_camara else ft.Icons.NO_PHOTOGRAPHY, size=80, color=ft.Colors.WHITE),
-                    ft.Text("ESCANEAR PALET", size=20, color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
-                    ft.Text("Toca para iniciar" if tiene_camara else "Cámara no detectada", size=12, color=ft.Colors.BLUE_100)
+                    ft.ProgressRing(width=20, height=20, stroke_width=2, color=ds.ACCENT_BLUE),
+                    self.txt_envio_msg
                 ],
-                alignment=ft.MainAxisAlignment.CENTER,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER
+                spacing=10,
+                alignment=ft.MainAxisAlignment.CENTER
             )
         )
 
-        self.controls = [
-            self.header,
-            ft.Divider(height=1, color=ft.Colors.GREY_200),
-            ft.Container(expand=True, content=self.scan_button, alignment=ft.alignment.center)
-        ]
+        content = ft.Column(
+            controls=[
+                ft.Row([
+                    ft.Icon(ft.Icons.QR_CODE_SCANNER, size=30, color=ds.ACCENT_BLUE),
+                    ft.Text("Recepción", size=20, weight=ft.FontWeight.BOLD, color=ds.TEXT_PRIMARY)
+                ], spacing=10),
+                ft.Divider(color=ds.SURFACE_ELEVATED),
+                ft.Container(
+                    padding=10,
+                    bgcolor=ds.SURFACE_ELEVATED,
+                    border_radius=ds.RADIUS_SM,
+                    content=ft.Row([
+                        ft.Icon(ft.Icons.INFO_OUTLINE, color=ds.ACCENT_BLUE),
+                        self.txt_estado
+                    ])
+                ),
+                ft.Divider(height=20, color=ft.Colors.TRANSPARENT),
+                self.info_container,
+                ft.Divider(height=20, color=ft.Colors.TRANSPARENT),
+                self.envio_status
+            ],
+            scroll=ft.ScrollMode.AUTO,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER
+        )
 
-    # --- MÉTODOS DE LÓGICA ---
+        return ft.Container(
+            expand=1,
+            margin=10,
+            padding=30,
+            bgcolor=ds.SURFACE_CARD,
+            border_radius=15,
+            shadow=ds.card_shadow(0.30),
+            content=content
+        )
 
-    def _abrir_modal_camara(self, e):
-        self.page.open(self.dlg_escaner)
+    def _build_camera_status(self):
+        self.txt_cam_status = ft.Text("En Pausa", weight=ft.FontWeight.BOLD, color=ds.ACCENT_BLUE)
+        self.status_icon = ft.Icon(ft.Icons.PAUSE_CIRCLE_OUTLINE, color=ds.ACCENT_BLUE)
+
+        return ft.Container(
+            content=ft.Row(
+                controls=[self.status_icon, self.txt_cam_status],
+                alignment=ft.MainAxisAlignment.CENTER,
+                spacing=5,
+                tight=True
+            ),
+            bgcolor=ds.SURFACE_OVERLAY,
+            padding=ft.padding.symmetric(horizontal=8, vertical=4),
+            border_radius=ds.RADIUS_SM,
+        )
+
+    # --------------------------------------------------------------------------
+    # SECCIÓN 2: CONTROL DE FLUJO Y EVENTOS
+    # --------------------------------------------------------------------------
+
+    def _toggle_camara(self, e):
+        activar = e.control.value
+        if activar:
+            self._iniciar_flujo_camara()
+        else:
+            self._detener_flujo_camara()
+
+    def _logout(self, e):
+        logger.debug(f"Evento de cierre de sessión: {e}")
+        self._detener_flujo_camara()
+
+        try:
+            self.mqtt_service.mqtt_manager.disconnect()
+            logger.info("MQTT desconectado al cerrar sesión")
+        except Exception as ex:
+            logger.warning(f"Error al desconectar MQTT: {ex}")
+
+        if self.user:
+            self.auth_service.cerrar_sesion(self.user)
+        self.page.session.remove('user')
+        self.page.go(AppRoutes.LOGIN)
+
+    def _iniciar_flujo_camara(self):
+        self._conectar_mqtt()
+
         self.camera_service.iniciar_camara()
-        
-        self.escaneando = True
+        self.escaneando = True      # Habilita AMBOS hilos (cámara + procesamiento)
         self.animando_linea = True
-        
-        threading.Thread(target=self._bucle_captura, daemon=True).start()
-        threading.Thread(target=self._animar_linea_bucle, daemon=True).start()
+        self.lectura_bloqueada = False
+        self.txt_cam_status.value = self.camera_id
+        self.txt_cam_status.color = ds.ACCENT_GREEN
+        self.status_icon.name = ft.Icons.VIDEOCAM
+        self.status_icon.color = ds.ACCENT_GREEN
 
-    def _cerrar_modal_camara(self, e):
+        self.page.update()
+
+        with self.frame_queue.mutex:
+            self.frame_queue.queue.clear()
+
+        self.txt_estado.value = "Buscando códigos GS1..."
+        self.txt_estado.color = ds.ACCENT_BLUE
+        self.txt_estado.update()
+
+        threading.Thread(target=self._thread_camera_loop, daemon=True).start()
+        threading.Thread(target=self._thread_processing_loop, daemon=True).start()
+        threading.Thread(target=self._thread_animacion, daemon=True).start()
+
+    def _detener_flujo_camara(self):
         self.escaneando = False
         self.animando_linea = False
         self.camera_service.detener_camara()
-        self.page.close(self.dlg_escaner)
 
-    def _animar_linea_bucle(self):
-        """Bucle infinito que mueve la línea de arriba a abajo"""
-        time.sleep(0.5)
-        direccion_abajo = True
-        while self.animando_linea:
-            # --- CORRECCIÓN 3: Eliminado 'ft.transform.' aquí también ---
-            nuevo_offset = ft.Offset(0, 1.2) if direccion_abajo else ft.Offset(0, -1.2)
-            
-            self.scan_line.offset = nuevo_offset
+        self.txt_cam_status.value = "PAUSA"
+        self.txt_cam_status.color = ds.TEXT_MUTED
+        self.status_icon.name = ft.Icons.VIDEOCAM_OFF
+        self.status_icon.color = ds.TEXT_MUTED
+
+        self.img_video.src_base64 = PLACEHOLDER_IMG
+        self.txt_estado.value = "Cámara en espera"
+        self.page.update()
+
+    def _limpiar_datos(self):
+        self.lectura_bloqueada = False
+
+        with self.frame_queue.mutex:
+            self.frame_queue.queue.clear()
+
+        self.palet_acumulado = PaletScanData()
+
+        self.txt_sscc.value = "---"
+        self.txt_sscc.color = ds.ACCENT_BLUE
+        self.txt_producto.value = "EAN: -"
+        self.txt_producto.weight = ft.FontWeight.NORMAL
+        self.txt_lote.value = "Lote: -"
+        self.txt_lote.color = ds.TEXT_SECONDARY
+        self.txt_fechas.value = "Caducidad: -"
+        self.txt_produccion.value = "Prod: -"
+
+        self.info_container.opacity = 0.3
+        self.info_container.update()
+
+        self.txt_estado.value = "Buscando códigos GS1..."
+        self.txt_estado.color = ds.ACCENT_BLUE
+        self.txt_estado.update()
+
+        self.scan_line.bgcolor = ds.ACCENT_BLUE
+        self.scan_line.update()
+
+        self.envio_status.visible = False
+        self.envio_status.update()
+
+        if self.escaneando and not self.animando_linea:
+            self.animando_linea = True
+            threading.Thread(target=self._thread_animacion, daemon=True).start()
+
+    # --------------------------------------------------------------------------
+    # SECCIÓN: GESTIÓN MQTT
+    # --------------------------------------------------------------------------
+
+    def _conectar_mqtt(self):
+        def _conectar_async():
             try:
+                if self.mqtt_service.mqtt_manager.connect(timeout=5.0):
+                    logger.info("Conexión MQTT establecida")
+                    self._actualizar_mqtt_status(conectado=True)
+                else:
+                    logger.warning("No se pudo conectar a MQTT")
+                    self._actualizar_mqtt_status(conectado=False)
+            except Exception as e:
+                logger.error(f"Error al conectar MQTT: {e}")
+                self._actualizar_mqtt_status(conectado=False)
+
+        threading.Thread(target=_conectar_async, daemon=True).start()
+
+    def _actualizar_mqtt_status(self, conectado: bool):
+        if conectado:
+            self.mqtt_status_icon.name = ft.Icons.CLOUD_DONE
+            self.mqtt_status_icon.color = ds.ACCENT_GREEN
+            self.mqtt_status_icon.tooltip = "MQTT conectado"
+        else:
+            self.mqtt_status_icon.name = ft.Icons.CLOUD_OFF
+            self.mqtt_status_icon.color = ds.ACCENT_RED
+            self.mqtt_status_icon.tooltip = "MQTT desconectado"
+
+        try:
+            self.mqtt_status_icon.update()
+        except Exception as e:
+            logger.warning(f"Error actualizando icono MQTT: {e}")
+
+    def _enviar_palet_mqtt(self):
+        def _enviar_async():
+            try:
+                self.envio_status.visible = True
+                self.txt_envio_msg.value = "Enviando datos..."
+                self.envio_status.update()
+
+                employee_number = getattr(self.user, 'employee_number', 'UNKNOWN')
+
+                enviado = self.mqtt_service.enviar_datos_palet(
+                    palet_data=self.palet_acumulado,
+                    employee_number=employee_number,
+                    station_code=self.station_code,
+                    station_cam_id=self.camera_id,
+                )
+
+                if enviado:
+                    logger.info(f"Palet acumulado {self.palet_acumulado.sscc} enviado exitosamente")
+                    self._mostrar_resultado_envio(exito=True)
+                else:
+                    logger.error(f"Error al enviar palet {self.palet_acumulado.sscc}")
+                    self._mostrar_resultado_envio(exito=False)
+
+            except Exception as e:
+                logger.exception(f"Error crítico enviando palet: {e}")
+                self._mostrar_resultado_envio(exito=False)
+
+        threading.Thread(target=_enviar_async, daemon=True).start()
+
+    def _mostrar_resultado_envio(self, exito: bool):
+        if exito:
+            self.envio_status.bgcolor = ft.Colors.with_opacity(0.12, ft.Colors.GREEN)
+            self.envio_status.content = ft.Column(
+                controls=[
+                    ft.Icon(ft.Icons.CHECK_CIRCLE, color=ds.ACCENT_GREEN, size=40),
+                    ft.Text(
+                        "Datos enviados correctamente",
+                        color=ds.ACCENT_GREEN,
+                        weight=ft.FontWeight.BOLD,
+                        text_align=ft.TextAlign.CENTER
+                    ),
+                    ft.Text(
+                        "Escanee el siguiente palet",
+                        color=ds.TEXT_SECONDARY,
+                        size=12,
+                        text_align=ft.TextAlign.CENTER
+                    )
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=5
+            )
+        else:
+            self.envio_status.bgcolor = ft.Colors.with_opacity(0.12, ft.Colors.RED)
+            self.envio_status.content = ft.Column(
+                controls=[
+                    ft.Icon(ft.Icons.ERROR, color=ds.ACCENT_RED, size=40),
+                    ft.Text(
+                        "Error al enviar datos",
+                        color=ds.ACCENT_RED,
+                        weight=ft.FontWeight.BOLD,
+                        text_align=ft.TextAlign.CENTER
+                    ),
+                    ft.Text(
+                        "Verifique la conexión MQTT",
+                        color=ds.TEXT_SECONDARY,
+                        size=12,
+                        text_align=ft.TextAlign.CENTER
+                    )
+                ],
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                spacing=5
+            )
+
+        self.envio_status.update()
+
+        if exito:
+            def _auto_limpiar():
+                time.sleep(3)
+                if self.escaneando:
+                    self._limpiar_datos()
+
+            threading.Thread(target=_auto_limpiar, daemon=True).start()
+
+    def _handle_scan_timeout(self):
+        logger.warning(f"Scan Timeout ({AppConfig.READ_TIMEOUT_SEC}s). Reporting damaged label.")
+
+        self.palet_acumulado.station_id = self.station_code
+        self.palet_acumulado.camera_id = self.camera_id
+
+        if self.palet_acumulado.sscc is None:
+            employee_number = getattr(self.user, 'employee_number', 'UNKNOWN')
+
+            threading.Thread(
+                target=self.audit_service.registrar_incidencia,
+                args=(employee_number, self.palet_acumulado, "TIMEOUT_ETIQUETA_DAÑADA"),
+                daemon=True
+            ).start()
+
+            self.txt_estado.value = "ETIQUETA DAÑADA"
+            self.txt_estado.color = ds.ACCENT_RED
+            self.scan_line.bgcolor = ds.ACCENT_RED
+            try:
+                self.txt_estado.update()
                 self.scan_line.update()
-            except: pass
-            
-            direccion_abajo = not direccion_abajo
-            time.sleep(1.6)
+            except Exception:
+                pass
 
-    def _bucle_captura(self):
-        time.sleep(0.5) 
+            time.sleep(AppConfig.POST_SEND_DELAY_SEC)
+
+        else:
+            logger.info(
+                f"Scan Timeout alcanzado. Palet con SSCC ({self.palet_acumulado.sscc}) omitido de auditoría de daños.")
+
+        self._limpiar_datos()
+
+        self.txt_estado.value = "ESPERANDO NUEVA ETIQUETA"
+        self.txt_estado.color = ds.TEXT_PRIMARY
+        self.scan_line.bgcolor = ds.ACCENT_BLUE
+        try:
+            self.txt_estado.update()
+            self.scan_line.update()
+        except Exception:
+            pass
+
+    # --------------------------------------------------------------------------
+    # SECCIÓN 3: LÓGICA DE HILOS
+    # --------------------------------------------------------------------------
+
+    _UI_PREVIEW_INTERVAL = 0.10  # Actualizar preview a ~10 fps (suficiente para UI industrial)
+
+    def _thread_camera_loop(self):
+        time.sleep(0.5)
+        last_ui_update = 0.0
+
         while self.escaneando:
-            try:
-                frame_b64 = self.camera_service.obtener_frame_base64()
+            frame_hd = self.camera_service.obtener_frame()
+
+            if frame_hd is None:
+                time.sleep(0.02)
+                continue
+
+            # Encolar frame para procesamiento IA lo antes posible
+            if not self.lectura_bloqueada:
+                try:
+                    self.frame_queue.put_nowait(frame_hd)
+                except queue.Full:
+                    pass
+
+            # Limitar encode + renderizado de preview a 10 fps
+            now = time.monotonic()
+            if now - last_ui_update >= self._UI_PREVIEW_INTERVAL:
+                frame_b64 = self.camera_service.convertir_numpy_a_base64(
+                    frame_hd, quality=50, width_resize=AppConfig.VIDEO_PREVIEW_WIDTH
+                )
                 if frame_b64:
                     self.img_video.src_base64 = frame_b64
                     try:
-                        self.img_video.update()
-                    except Exception as e:
-                        logger.warning(f"Error actualizando frame: {e}")
+                        self.img_video.update()  # Solo actualiza el control de imagen, no toda la página
+                    except Exception:
+                        pass
+                last_ui_update = now
+
+    def _thread_processing_loop(self):
+        while self.escaneando:  # Mismo flag que _thread_camera_loop
+
+            if (self.palet_acumulado.scan_start_time is not None
+                    and self.palet_acumulado.has_timed_out(AppConfig.READ_TIMEOUT_SEC)):
+
+                if self.palet_acumulado.sscc:
+                    logger.info(f"Fin de los 5s de parada. Enviando palet SSCC: {self.palet_acumulado.sscc}")
+                    self._finalizar_palet()
+                else:
+                    logger.warning("Fin de los 5s de parada sin detectar SSCC. Marcando como ETIQUETA DAÑADA.")
+                    self._handle_scan_timeout()
+
+                with self.frame_queue.mutex:
+                    self.frame_queue.queue.clear()
+
+                continue
+
+            try:
+                frame = self.frame_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            if self.lectura_bloqueada:
+                self.frame_queue.task_done()
+                continue
+
+            try:
+                rois_detectados = self.yolo_service.detectar(frame)
+
+                if rois_detectados is None or len(rois_detectados) > 0:
+                    self.palet_acumulado.init_timeout()
+
+                scan_result_dto = self.scanner_service.procesar_zonas(frame, rois_detectados)
+
+                if self._fusionar_datos(scan_result_dto):
+                    self._actualizar_ui_progreso()
+
+                    if self.palet_acumulado.is_fully_captured():
+                        logger.info("Lectura al 100% completada antes de 5s. Finalizando anticipadamente.")
+                        self._finalizar_palet()
+                        with self.frame_queue.mutex:
+                            self.frame_queue.queue.clear()
+
             except Exception as e:
-                logger.error(f"Error en bucle de cámara: {e}")
-            time.sleep(0.03)
-            
-    def _logout(self, e):
-        self.auth_service.cerrar_sesion(self.user)
-        self.page.session.clear()
-        self.page.go("/login")
+                logger.error(f"Error en hilo de procesamiento IA: {e}")
+            finally:
+                self.frame_queue.task_done()
+
+    def _fusionar_datos(self, nuevo_dato: PaletScanData) -> bool:
+        acc = self.palet_acumulado
+        hubo_cambios = False
+
+        if nuevo_dato.sscc and not acc.sscc:
+            acc.sscc = nuevo_dato.sscc
+            hubo_cambios = True
+        if nuevo_dato.ean and not acc.ean:
+            acc.ean = nuevo_dato.ean
+            hubo_cambios = True
+        if nuevo_dato.batch_number and not acc.batch_number:
+            acc.batch_number = nuevo_dato.batch_number
+            hubo_cambios = True
+        if nuevo_dato.product_use_by_date and not acc.product_use_by_date:
+            acc.product_use_by_date = nuevo_dato.product_use_by_date
+            hubo_cambios = True
+        if nuevo_dato.packaging_date and not acc.packaging_date:
+            acc.packaging_date = nuevo_dato.packaging_date
+            hubo_cambios = True
+        if nuevo_dato.production_time and not acc.production_time:
+            acc.production_time = nuevo_dato.production_time
+            hubo_cambios = True
+
+        if hubo_cambios and not acc._fully_captured:
+            acc._fully_captured = bool(
+                acc.sscc and acc.ean and acc.batch_number
+                and acc.product_use_by_date and acc.packaging_date
+            )
+
+        return hubo_cambios
+
+    def _actualizar_ui_progreso(self):
+        p = self.palet_acumulado
+
+        if p.sscc:
+            self.txt_sscc.value = p.sscc
+            self.txt_sscc.color = ds.ACCENT_BLUE
+
+        ean_val = getattr(p, 'ean', None) or getattr(p, 'gtin', None)
+        if ean_val:
+            self.txt_producto.value = f"EAN: {ean_val}"
+            self.txt_producto.weight = ft.FontWeight.BOLD
+
+        if p.batch_number:
+            self.txt_lote.value = f"Lote: {p.batch_number}"
+            self.txt_lote.color = ds.TEXT_PRIMARY
+
+        if p.product_use_by_date:
+            self.txt_fechas.value = f"Caducidad: {p.product_use_by_date}"
+
+        prod_str = []
+        if p.packaging_date: prod_str.append(p.packaging_date)
+        if p.production_time: prod_str.append(p.production_time)
+        if prod_str:
+            self.txt_produccion.value = f"Prod: {' '.join(prod_str)}"
+
+        self.info_container.opacity = 1.0
+        self.info_container.update()
+
+    def _finalizar_palet(self):
+        self.lectura_bloqueada = True
+
+        self.txt_estado.value = "PALET COMPLETADO"
+        self.txt_estado.color = ds.ACCENT_GREEN
+        self.animando_linea = False
+        self.scan_line.offset = ft.Offset(1.2, 0)
+        self.scan_line.bgcolor = ds.ACCENT_GREEN
+
+        try:
+            self.txt_estado.update()
+            self.scan_line.update()
+        except Exception:
+            pass
+
+        logger.info(f"Palet SSCC: {self.palet_acumulado.sscc} completado")
+        self._enviar_palet_mqtt()
+
+    def _thread_animacion(self):
+        direccion_abajo = True
+        while self.animando_linea and self.escaneando:
+            nuevo_offset = ft.Offset(1.2, 0) if direccion_abajo else ft.Offset(-1.2, 0)
+            self.scan_line.offset = nuevo_offset
+            try:
+                self.scan_line.update()
+            except Exception as e:
+                logger.debug(f"Animación detenida (UI no accesible): {e}")
+                break
+
+            direccion_abajo = not direccion_abajo
+            time.sleep(1.6)
