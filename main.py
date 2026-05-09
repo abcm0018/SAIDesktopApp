@@ -141,7 +141,7 @@ async def main(page: ft.Page):
         # Si db_manager.connect() tarda mucho, deberías envolverlo en asyncio.to_thread
         
         # --- B. Inteligencia Artificial (El paso lento) ---
-        loading_text.value = "Cargando Modelos de IA (YOLOv5)..."
+        loading_text.value = "Cargando módulos del sistema"
         page.update()
         
         yolo_config = YoloConfig()

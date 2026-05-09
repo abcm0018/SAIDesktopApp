@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 from datetime import datetime
 
 @dataclass
@@ -14,27 +14,24 @@ class PaletScanData:
     product_use_by_date: Optional[str] = None  # Formato: DD/MM/20AA
     packaging_date: Optional[str] = None       # Formato: DD/MM/20AA
     production_time: Optional[str] = None      # Formato: HH:MM
-    
+
     # Metadatos de control
     ultimo_update: datetime = field(default_factory=datetime.now)
-    
+
     # Campo de metadatos adicional (no serializado)
     scan_start_time: Optional[datetime] = None
 
+    def __post_init__(self):
+        # Flag cacheado para evitar re-evaluar todos los campos en cada frame
+        self._fully_captured: bool = False
+
     def is_complete(self) -> bool:
-        """
-        Define si el palet tiene la información mínima necesaria.
-        Valida que los campos obligatorios no sean None.
-        """
-        campos_obligatorios = [
-            self.sscc, 
-            self.ean, 
-            self.batch_number, 
-            self.product_use_by_date
-            # self.production_time # Descomentar si la hora es crítica
-        ]
-        # Verificamos que ninguno sea None
-        return all(v and str(v).strip() for v in campos_obligatorios)
+        """El SSCC es obligatorio para procesar el palet en el backend."""
+        return bool(self.sscc and str(self.sscc).strip())
+
+    def is_fully_captured(self) -> bool:
+        """Indica si hemos capturado toda la información de la etiqueta. O(1) — flag cacheado."""
+        return self._fully_captured
     
     def init_timeout(self):
         """

@@ -63,7 +63,8 @@ class AuthService:
         hash_almacenado = user.password.encode('utf-8') if isinstance(user.password, str) else user.password
         return bcrypt.checkpw(contrasena_input.encode('utf-8'), hash_almacenado)
 
-    def cerrar_sesion(self, user: User):
+    @staticmethod
+    def cerrar_sesion(user: User):
         if user:
             logger.info(f"Usuario {user.employee_number} ha cerrado sesión.")
         else:

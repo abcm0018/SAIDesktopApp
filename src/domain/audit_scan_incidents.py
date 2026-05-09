@@ -2,7 +2,7 @@ from datetime import datetime
 
 from sqlalchemy import Column, Integer, DateTime, String, Text
 
-from domain.bae import Base
+from src.domain.bae import Base
 
 
 class AuditScanIncidents(Base):

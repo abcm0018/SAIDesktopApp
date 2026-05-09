@@ -37,29 +37,25 @@ class YoloService:
             return []
         
         try:
-            # 1. Procesamiento: OpenCV (BGR) -> YOLO -> (RGB)
+            # 1. Procesamiento: OpenCV (BGR) -> YOLO (RGB)
             img_rgb = frame[..., ::-1]
-            
+
             # 2. Inferencia
             results = self.model(img_rgb, size=640)
-            
-            # 3. Post-procesamiento
-            df = results.pandas().xyxy[0]
-            
-            detecciones = []
-            for _, row in df.iterrows():
-                # Doble verificación del umbral (aunque el modelo suele filtrar internamente)
-                if row['confidence'] < self.conf_threshold:
-                    continue
 
-                x1, y1 = int(row['xmin']), int(row['ymin'])
-                x2, y2 = int(row['xmax']), int(row['ymax'])
-                w = x2 - x1
-                h = y2 - y1
-                
+            # 3. Post-procesamiento con numpy — evita la costosa conversión a pandas
+            # Tensor shape: (N, 6) → [x1, y1, x2, y2, conf, cls]
+            det = results.xyxy[0].cpu().numpy()
+
+            detecciones = []
+            for row in det:
+                if row[4] < self.conf_threshold:
+                    continue
+                x1, y1, x2, y2 = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+                w, h = x2 - x1, y2 - y1
                 if w > 0 and h > 0:
                     detecciones.append((x1, y1, w, h))
-            
+
             return detecciones
         except Exception as e:
             logger.error(f"Error en iferencia YOLO: {e}")
@@ -78,36 +74,28 @@ class YoloService:
             return resultados
 
         try:
-            # 1. Inferencia (Tal cual lo hacía yolo_scan_service)
+            # 1. Inferencia
             results = self.model(frame)
-            detections = results.pandas().xyxy[0]
-            
-            h_img, w_img = frame.shape[:2]
-            PADDING = 15 # Lógica diferencial: Agrega márgenes
 
-            # 2. Procesar cada detección
-            for _, row in detections.iterrows():
-                confianza = row['confidence']
-                
-                # Usamos self.conf_threshold para mantener consistencia en el servicio
-                if confianza < self.conf_threshold:
+            h_img, w_img = frame.shape[:2]
+            PADDING = 15
+
+            # 2. Post-procesamiento con numpy — evita la costosa conversión a pandas
+            det = results.xyxy[0].cpu().numpy()
+
+            for row in det:
+                if row[4] < self.conf_threshold:
                     continue
 
-                # Lógica de coordenadas de yolo_scan_service:
-                # - Aplica Padding
-                # - Usa max/min para evitar errores de índice fuera de rango
-                x1 = max(0, int(row['xmin']) - PADDING)
-                y1 = max(0, int(row['ymin']) - PADDING)
-                x2 = min(w_img, int(row['xmax']) + PADDING)
-                y2 = min(h_img, int(row['ymax']) + PADDING)
-                
-                # Convertimos a formato (x, y, w, h) para igualar el output de 'detectar'
-                w = x2 - x1
-                h = y2 - y1
-                
+                x1 = max(0, int(row[0]) - PADDING)
+                y1 = max(0, int(row[1]) - PADDING)
+                x2 = min(w_img, int(row[2]) + PADDING)
+                y2 = min(h_img, int(row[3]) + PADDING)
+
+                w, h = x2 - x1, y2 - y1
                 if w > 0 and h > 0:
                     resultados.append((x1, y1, w, h))
-            
+
             return resultados
 
         except Exception as e:

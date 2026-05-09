@@ -164,13 +164,11 @@ class MqttManager:
         logger.info(f"Intento de reconexión {self._reconnect_attempts}/{self._max_reconnect_attempts}")
         return self.connect()
 
-    # ========== Callbacks ==========
-    
     def _on_connect(self, client, userdata, flags, rc):
         """Callback ejecutado al conectar."""
         if rc == 0:
             self._is_connected = True
-            logger.info(f"✅ Conectado a MQTT: {self.config.broker}")
+            logger.info(f"Conectado a MQTT: {self.config.broker}")
         else:
             self._is_connected = False
             error_messages = {

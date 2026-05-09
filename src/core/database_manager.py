@@ -3,7 +3,6 @@ import os
 from contextlib import contextmanager
 from typing import Generator
 
-from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -27,8 +26,6 @@ class DatabaseManager:
 
     def _get_default_db_url(self) -> str:
         """Construye la URL de conexión desde variables de entorno."""
-        load_dotenv()
-        
         user = os.getenv("DB_USER")
         password = os.getenv("DB_PASSWORD")
         host = os.getenv("DB_HOST")

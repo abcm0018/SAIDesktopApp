@@ -4,7 +4,7 @@ import threading
 import time
 import flet as ft
 
-from services.audit_service import AuditService
+from src.services.audit_service import AuditService
 from src.config.app_config import AppConfig
 from src.services.auth_service import AuthService
 from src.services.camera_service import CameraService
@@ -48,11 +48,11 @@ class DashboardView(ft.Column):
 
         self.en_periodo_gracia = False
         self.tiempo_inicio_gracia = 0
-        self.segundos_gracia = 5
+        self.segundos_gracia = AppConfig.READ_TIMEOUT_SEC
 
         self.expand = True
         self.spacing = 0
-        self.is_scanning = True
+        self.escaneando = False      # Flag canónico: controla AMBOS hilos de fondo
         self.animando_linea = False
         self.lectura_bloqueada = False
 
@@ -327,7 +327,7 @@ class DashboardView(ft.Column):
         self._conectar_mqtt()
 
         self.camera_service.iniciar_camara()
-        self.escaneando = True
+        self.escaneando = True      # Habilita AMBOS hilos (cámara + procesamiento)
         self.animando_linea = True
         self.lectura_bloqueada = False
         self.txt_cam_status.value = self.camera_id
@@ -528,12 +528,16 @@ class DashboardView(ft.Column):
                 daemon=True
             ).start()
 
-            self.txt_estado.value = "❌ ETIQUETA DAÑADA"
+            self.txt_estado.value = "ETIQUETA DAÑADA"
             self.txt_estado.color = ds.ACCENT_RED
             self.scan_line.bgcolor = ds.ACCENT_RED
-            self.update()
+            try:
+                self.txt_estado.update()
+                self.scan_line.update()
+            except Exception:
+                pass
 
-            time.sleep(2.0)
+            time.sleep(AppConfig.POST_SEND_DELAY_SEC)
 
         else:
             logger.info(
@@ -544,14 +548,21 @@ class DashboardView(ft.Column):
         self.txt_estado.value = "ESPERANDO NUEVA ETIQUETA"
         self.txt_estado.color = ds.TEXT_PRIMARY
         self.scan_line.bgcolor = ds.ACCENT_BLUE
-        self.update()
+        try:
+            self.txt_estado.update()
+            self.scan_line.update()
+        except Exception:
+            pass
 
     # --------------------------------------------------------------------------
     # SECCIÓN 3: LÓGICA DE HILOS
     # --------------------------------------------------------------------------
 
+    _UI_PREVIEW_INTERVAL = 0.10  # Actualizar preview a ~10 fps (suficiente para UI industrial)
+
     def _thread_camera_loop(self):
         time.sleep(0.5)
+        last_ui_update = 0.0
 
         while self.escaneando:
             frame_hd = self.camera_service.obtener_frame()
@@ -560,24 +571,29 @@ class DashboardView(ft.Column):
                 time.sleep(0.02)
                 continue
 
-            frame_b64 = self.camera_service.convertir_numpy_a_base64(
-                frame_hd, quality=50, width_resize=800
-            )
-
-            if frame_b64:
-                self.img_video.src_base64 = frame_b64
-                self.page.update()
-
+            # Encolar frame para procesamiento IA lo antes posible
             if not self.lectura_bloqueada:
                 try:
                     self.frame_queue.put_nowait(frame_hd)
                 except queue.Full:
                     pass
 
-            time.sleep(0.025)
+            # Limitar encode + renderizado de preview a 10 fps
+            now = time.monotonic()
+            if now - last_ui_update >= self._UI_PREVIEW_INTERVAL:
+                frame_b64 = self.camera_service.convertir_numpy_a_base64(
+                    frame_hd, quality=50, width_resize=AppConfig.VIDEO_PREVIEW_WIDTH
+                )
+                if frame_b64:
+                    self.img_video.src_base64 = frame_b64
+                    try:
+                        self.img_video.update()  # Solo actualiza el control de imagen, no toda la página
+                    except Exception:
+                        pass
+                last_ui_update = now
 
     def _thread_processing_loop(self):
-        while self.is_scanning:
+        while self.escaneando:  # Mismo flag que _thread_camera_loop
 
             if (self.palet_acumulado.scan_start_time is not None
                     and self.palet_acumulado.has_timed_out(AppConfig.READ_TIMEOUT_SEC)):
@@ -614,7 +630,7 @@ class DashboardView(ft.Column):
                 if self._fusionar_datos(scan_result_dto):
                     self._actualizar_ui_progreso()
 
-                    if hasattr(self.palet_acumulado, 'is_fully_captured') and self.palet_acumulado.is_fully_captured():
+                    if self.palet_acumulado.is_fully_captured():
                         logger.info("Lectura al 100% completada antes de 5s. Finalizando anticipadamente.")
                         self._finalizar_palet()
                         with self.frame_queue.mutex:
@@ -626,17 +642,33 @@ class DashboardView(ft.Column):
                 self.frame_queue.task_done()
 
     def _fusionar_datos(self, nuevo_dato: PaletScanData) -> bool:
+        acc = self.palet_acumulado
         hubo_cambios = False
-        attrs = ['sscc', 'ean', 'batch_number', 'product_use_by_date', 'packaging_date', 'production_time']
 
-        for attr in attrs:
-            nuevo_valor = getattr(nuevo_dato, attr, None)
-            valor_actual = getattr(self.palet_acumulado, attr, None)
+        if nuevo_dato.sscc and not acc.sscc:
+            acc.sscc = nuevo_dato.sscc
+            hubo_cambios = True
+        if nuevo_dato.ean and not acc.ean:
+            acc.ean = nuevo_dato.ean
+            hubo_cambios = True
+        if nuevo_dato.batch_number and not acc.batch_number:
+            acc.batch_number = nuevo_dato.batch_number
+            hubo_cambios = True
+        if nuevo_dato.product_use_by_date and not acc.product_use_by_date:
+            acc.product_use_by_date = nuevo_dato.product_use_by_date
+            hubo_cambios = True
+        if nuevo_dato.packaging_date and not acc.packaging_date:
+            acc.packaging_date = nuevo_dato.packaging_date
+            hubo_cambios = True
+        if nuevo_dato.production_time and not acc.production_time:
+            acc.production_time = nuevo_dato.production_time
+            hubo_cambios = True
 
-            if nuevo_valor:
-                if not valor_actual or valor_actual != nuevo_valor:
-                    setattr(self.palet_acumulado, attr, nuevo_valor)
-                    hubo_cambios = True
+        if hubo_cambios and not acc._fully_captured:
+            acc._fully_captured = bool(
+                acc.sscc and acc.ean and acc.batch_number
+                and acc.product_use_by_date and acc.packaging_date
+            )
 
         return hubo_cambios
 
@@ -671,17 +703,19 @@ class DashboardView(ft.Column):
     def _finalizar_palet(self):
         self.lectura_bloqueada = True
 
-        self.txt_estado.value = "✅ PALET COMPLETADO"
+        self.txt_estado.value = "PALET COMPLETADO"
         self.txt_estado.color = ds.ACCENT_GREEN
-
         self.animando_linea = False
         self.scan_line.offset = ft.Offset(1.2, 0)
         self.scan_line.bgcolor = ds.ACCENT_GREEN
 
-        self.update()
+        try:
+            self.txt_estado.update()
+            self.scan_line.update()
+        except Exception:
+            pass
 
         logger.info(f"Palet SSCC: {self.palet_acumulado.sscc} completado")
-
         self._enviar_palet_mqtt()
 
     def _thread_animacion(self):

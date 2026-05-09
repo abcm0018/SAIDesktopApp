@@ -23,28 +23,24 @@ class MqttService:
     def __init__(self, mqtt_manager: MqttManager):
         """
         Inicializa el servicio MQTT.
-        
+
         Args:
             mqtt_manager: Instancia del gestor de infraestructura MQTT.
         """
         self.mqtt_manager = mqtt_manager
 
-    def enviar_datos_palet(self, palet_data: PaletScanData, employee_number: str) -> bool:
+    def enviar_datos_palet(self, palet_data: PaletScanData, employee_number: str, station_code: str, station_cam_id: str) -> bool:
         """
         Envía los datos de un palet escaneado al sistema backend.
         
         Args:
             palet_data: Datos del palet escaneado.
             employee_number: Número de empleado.
-            
+            station_code: Código del puesto de trabajo.
+            station_cam_id: Identificador de la cámara del puesto de trabajo.
         Returns:
             True si el envío fue exitoso, False en caso contrario.
         """
-        # Validación de completitud
-        if not palet_data.is_complete():
-            logger.warning(f"Intento de envío de palet incompleto (SSCC: {palet_data.sscc or 'N/A'})")
-            return False
-
         # Validación de employee_number
         if not employee_number or not isinstance(employee_number, str):
             logger.error(f"Número de empleado inválido: {employee_number}")
@@ -52,7 +48,7 @@ class MqttService:
 
         try:
             # Construir payload
-            payload = self._build_payload(palet_data, employee_number)
+            payload = self._build_payload(palet_data, employee_number, station_code, station_cam_id)
             
             # Serializar a JSON
             json_payload = json.dumps(payload, ensure_ascii=False, indent=None)
@@ -113,17 +109,18 @@ class MqttService:
             return False
         
 
-    def _build_payload(self, palet_data: PaletScanData, employee_number: str) -> Dict:
+    @staticmethod
+    def _build_payload(palet_data: PaletScanData, employee_number: str, station_code: str, station_cam_id: str) -> Dict:
         """
         Construye el payload JSON para enviar al backend.
-        
+
         NOTA: Asume que palet_data tiene fechas en formato UI (DD/MM/YYYY).
         Las transforma a formato ISO (YYYY-MM-DD) para el backend Java.
-        
+
         Args:
             palet_data: Datos del palet.
             employee_number: Número de empleado.
-            
+
         Returns:
             Diccionario con el payload formateado.
         """
@@ -131,10 +128,10 @@ class MqttService:
         iso_use_by_date = DateTimeFormatter.ui_date_to_iso(palet_data.product_use_by_date)
         iso_packaging_date = DateTimeFormatter.ui_date_to_iso(palet_data.packaging_date)
         iso_production_time = DateTimeFormatter.ui_time_to_iso(palet_data.production_time)
-        
+
         # Timestamp actual del escaneo
         scan_timestamp = datetime.now().isoformat(timespec='seconds')
-        
+
         return {
             "sscc": palet_data.sscc,
             "ean": palet_data.ean,
@@ -142,7 +139,8 @@ class MqttService:
             "productUseByDate": iso_use_by_date,
             "packagingDate": iso_packaging_date,
             "productionTime": iso_production_time,
-            "sscc": palet_data.sscc,
             "employeeNumber": employee_number,
-            "scanDate": scan_timestamp
+            "scanDate": scan_timestamp,
+            "stationId": station_code,
+            "cameraId": station_cam_id
         }

@@ -2,7 +2,7 @@ import logging
 import flet as ft
 from typing import Callable, Dict
 
-from services.audit_service import AuditService
+from src.services.audit_service import AuditService
 from src.services.mqtt_service import MqttService
 from src.services.yolo_service import YoloService
 from src.config.routes import AppRoutes
