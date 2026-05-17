@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from typing import Optional
 import paho.mqtt.client as mqtt
@@ -37,6 +38,7 @@ class MqttManager:
         self._is_connected = False
         self._reconnect_attempts = 0
         self._max_reconnect_attempts = 3
+        self._connect_event = threading.Event()
 
         # Configurar autenticación si existe
         if self.config.user and self.config.password:
@@ -69,23 +71,19 @@ class MqttManager:
         """
         try:
             logger.info(f"Conectando a {self.config.broker}:{self.config.port}...")
+            self._connect_event.clear()
             self.client.connect(
-                self.config.broker, 
-                self.config.port, 
+                self.config.broker,
+                self.config.port,
                 self.config.keepalive
             )
             self.client.loop_start()
-            
-            # Esperar a que se establezca la conexión
-            elapsed = 0.0
-            while not self._is_connected and elapsed < timeout:
-                time.sleep(0.1)
-                elapsed += 0.1
-            
-            if not self._is_connected:
+
+            connected = self._connect_event.wait(timeout=timeout)
+            if not connected:
                 logger.error("Timeout esperando conexión MQTT")
                 return False
-                
+
             self._reconnect_attempts = 0
             return True
 
@@ -150,24 +148,28 @@ class MqttManager:
             return False
 
     def _attempt_reconnect(self) -> bool:
-        """
-        Intenta reconectar al broker MQTT.
-        
-        Returns:
-            True si la reconexión fue exitosa.
-        """
+        """Intenta reconectar con backoff exponencial (1s → 2s → 4s … 32s máx)."""
         if self._reconnect_attempts >= self._max_reconnect_attempts:
-            logger.error(f"Máximo de intentos de reconexión alcanzado ({self._max_reconnect_attempts})")
+            logger.error(
+                "Máximo de intentos de reconexión alcanzado (%d). Broker inaccesible.",
+                self._max_reconnect_attempts
+            )
             return False
-            
+
+        delay = min(2 ** self._reconnect_attempts, 32)
         self._reconnect_attempts += 1
-        logger.info(f"Intento de reconexión {self._reconnect_attempts}/{self._max_reconnect_attempts}")
+        logger.info(
+            "Reconexión %d/%d en %ds...",
+            self._reconnect_attempts, self._max_reconnect_attempts, delay
+        )
+        time.sleep(delay)
         return self.connect()
 
     def _on_connect(self, client, userdata, flags, rc):
         """Callback ejecutado al conectar."""
         if rc == 0:
             self._is_connected = True
+            self._connect_event.set()
             logger.info(f"Conectado a MQTT: {self.config.broker}")
         else:
             self._is_connected = False

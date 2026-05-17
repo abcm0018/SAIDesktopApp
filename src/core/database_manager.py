@@ -16,7 +16,12 @@ class DatabaseManager:
 
     def __init__(self, db_url: str = None, echo: bool = False):
         self.db_url = db_url or self._get_default_db_url()
-        self.engine = create_engine(self.db_url, echo=echo)
+        self.engine = create_engine(
+            self.db_url,
+            echo=echo,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+        )
         self.session_factory = sessionmaker(
             autocommit=False, 
             autoflush=False, 

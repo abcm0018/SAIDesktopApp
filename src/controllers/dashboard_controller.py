@@ -50,6 +50,10 @@ class DashboardController:
         self.processing_thread = None
         self._mqtt_thread = None
 
+        # Telemetría de frames descartados
+        self._frames_dropped = 0
+        self._FRAME_DROP_WARN_EVERY = 30
+
     # -------------------------------------------------------------------------
     # PROPIEDADES THREAD-SAFE
     # -------------------------------------------------------------------------
@@ -161,8 +165,15 @@ class DashboardController:
                 if not self.lectura_bloqueada:
                     try:
                         self.frame_queue.put_nowait(frame)
+                        self._frames_dropped = 0
                     except queue.Full:
-                        pass  # Frame descartado — el procesamiento no puede seguir el ritmo
+                        self._frames_dropped += 1
+                        if self._frames_dropped % self._FRAME_DROP_WARN_EVERY == 0:
+                            logger.warning(
+                                "Pipeline saturado: %d frames descartados acumulados. "
+                                "El procesamiento IA no sigue el ritmo de la cámara.",
+                                self._frames_dropped
+                            )
             else:
                 time.sleep(0.01)
 
