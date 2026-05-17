@@ -59,6 +59,10 @@ class DashboardView(ft.Column):
         self.palet_acumulado = PaletScanData()
         self.frame_queue = queue.Queue(maxsize=1)
 
+        self._camera_thread: threading.Thread | None = None
+        self._processing_thread: threading.Thread | None = None
+        self._anim_thread: threading.Thread | None = None
+
         # --- Construcción de UI ---
         self.header = self._build_header()
         self.left_panel = self._build_camera_panel()
@@ -309,8 +313,13 @@ class DashboardView(ft.Column):
             self._detener_flujo_camara()
 
     def _logout(self, e):
-        logger.debug(f"Evento de cierre de sessión: {e}")
+        logger.debug(f"Evento de cierre de sesión: {e}")
         self._detener_flujo_camara()
+
+        _JOIN_TIMEOUT = 1.0
+        for hilo in (self._camera_thread, self._processing_thread, self._anim_thread):
+            if hilo is not None and hilo.is_alive():
+                hilo.join(timeout=_JOIN_TIMEOUT)
 
         try:
             self.mqtt_service.mqtt_manager.disconnect()
@@ -320,7 +329,12 @@ class DashboardView(ft.Column):
 
         if self.user:
             self.auth_service.cerrar_sesion(self.user)
-        self.page.session.remove('user')
+
+        try:
+            self.page.session.remove('user')
+        except KeyError:
+            logger.warning("La clave 'user' ya había sido eliminada de la sesión")
+
         self.page.go(AppRoutes.LOGIN)
 
     def _iniciar_flujo_camara(self):
@@ -344,9 +358,12 @@ class DashboardView(ft.Column):
         self.txt_estado.color = ds.ACCENT_BLUE
         self.txt_estado.update()
 
-        threading.Thread(target=self._thread_camera_loop, daemon=True).start()
-        threading.Thread(target=self._thread_processing_loop, daemon=True).start()
-        threading.Thread(target=self._thread_animacion, daemon=True).start()
+        self._camera_thread = threading.Thread(target=self._thread_camera_loop, daemon=True)
+        self._processing_thread = threading.Thread(target=self._thread_processing_loop, daemon=True)
+        self._anim_thread = threading.Thread(target=self._thread_animacion, daemon=True)
+        self._camera_thread.start()
+        self._processing_thread.start()
+        self._anim_thread.start()
 
     def _detener_flujo_camara(self):
         self.escaneando = False
