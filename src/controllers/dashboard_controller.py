@@ -35,9 +35,9 @@ class DashboardController:
 
         self.pallet_service = PalletProcessingService()
 
-        # Estado del controlador
-        self.is_scanning = False
-        self.lectura_bloqueada = False
+        # Estado del controlador — thread-safe mediante threading.Event
+        self._scanning = threading.Event()
+        self._blocked = threading.Event()
         self.frame_queue = queue.Queue(maxsize=AppConfig.QUEUE_MAX_SIZE)
 
         # Cola de publicaciones MQTT — procesada en hilo dedicado
@@ -49,6 +49,31 @@ class DashboardController:
         self.camera_thread = None
         self.processing_thread = None
         self._mqtt_thread = None
+
+    # -------------------------------------------------------------------------
+    # PROPIEDADES THREAD-SAFE
+    # -------------------------------------------------------------------------
+    @property
+    def is_scanning(self) -> bool:
+        return self._scanning.is_set()
+
+    @is_scanning.setter
+    def is_scanning(self, value: bool) -> None:
+        if value:
+            self._scanning.set()
+        else:
+            self._scanning.clear()
+
+    @property
+    def lectura_bloqueada(self) -> bool:
+        return self._blocked.is_set()
+
+    @lectura_bloqueada.setter
+    def lectura_bloqueada(self, value: bool) -> None:
+        if value:
+            self._blocked.set()
+        else:
+            self._blocked.clear()
 
     # -------------------------------------------------------------------------
     # ACCIONES DESDE LA VISTA (Inputs del usuario)
@@ -84,9 +109,12 @@ class DashboardController:
 
         self.view.iniciar_animacion_escaneo()
 
-        self.camera_thread = threading.Thread(target=self._camera_capture_loop, daemon=True)
-        self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
-        self._mqtt_thread = threading.Thread(target=self._mqtt_sender_loop, daemon=True)
+        self.camera_thread = threading.Thread(
+            target=self._camera_capture_loop, daemon=False, name="sai-camera")
+        self.processing_thread = threading.Thread(
+            target=self._processing_loop, daemon=False, name="sai-processing")
+        self._mqtt_thread = threading.Thread(
+            target=self._mqtt_sender_loop, daemon=False, name="sai-mqtt")
 
         self.camera_thread.start()
         self.processing_thread.start()
@@ -94,7 +122,7 @@ class DashboardController:
 
     def _stop_system(self):
         self.is_scanning = False
-        self._cooldown_event.set()  # Desbloquea cualquier cooldown en curso
+        self._cooldown_event.set()
 
         if self.camera_service:
             self.camera_service.detener_camara()
@@ -103,6 +131,22 @@ class DashboardController:
             self.frame_queue.queue.clear()
 
         self.view.detener_animacion_escaneo()
+
+        # Esperar el drenado de hilos en background para no bloquear la UI.
+        # Los hilos son non-daemon: el proceso no termina hasta que ellos acaben.
+        threading.Thread(target=self._join_threads, daemon=True, name="sai-shutdown").start()
+
+    def _join_threads(self):
+        pairs = [
+            (self.camera_thread, 2.0),
+            (self.processing_thread, 2.0),
+            (self._mqtt_thread, 10.0),
+        ]
+        for thread, timeout in pairs:
+            if thread and thread.is_alive():
+                thread.join(timeout=timeout)
+                if thread.is_alive():
+                    logger.warning("El hilo '%s' no terminó en %.1fs", thread.name, timeout)
 
     def _camera_capture_loop(self):
         """Hilo Productor: Lee la cámara y mete frames en la cola."""
@@ -189,17 +233,20 @@ class DashboardController:
 
         self.view.mostrar_estado_exito()
 
-        # Encolar publicación MQTT — el hilo dedicado la procesa sin bloquear aquí
+        # Encolar publicación MQTT con espera de hasta 5s para que el sender drene
         empleado = self.auth_service.get_current_user() or "0000"
         try:
-            self._mqtt_queue.put_nowait({
+            self._mqtt_queue.put({
                 "palet_data": palet,
                 "employee_number": empleado,
                 "station_code": self.page.session.get("station_code"),
                 "station_cam_id": self.page.session.get("camera_id"),
-            })
+            }, block=True, timeout=5.0)
         except queue.Full:
-            logger.error("Cola MQTT llena; palet SSCC=%s no enviado", palet.sscc)
+            logger.critical(
+                "Cola MQTT llena tras 5s de espera; palet SSCC=%s NO enviado. "
+                "Revisar conectividad con el broker.", palet.sscc
+            )
 
         self.audit_service.log_scan_success(palet.sscc)
 

@@ -1,6 +1,7 @@
 import base64
 import logging
 import sys
+import threading
 from typing import Optional
 
 import cv2
@@ -33,6 +34,7 @@ class CameraService:
 
         # Estado interno
         self.cap: Optional[cv2.VideoCapture] = None
+        self._cap_lock = threading.Lock()
 
     def __enter__(self):
         """Permite usar 'with CameraService() as cam:'"""
@@ -62,26 +64,27 @@ class CameraService:
         return False
 
     def detener_camara(self):
-        if self.cap:
-            logger.info("Liberando recursos de cámara...")
-            self.cap.release()
-            self.cap = None
+        with self._cap_lock:
+            if self.cap:
+                logger.info("Liberando recursos de cámara...")
+                self.cap.release()
+                self.cap = None
 
     def obtener_frame(self) -> Optional[np.ndarray]:
         """
-        Captura un frame.
-        Incluye lógica de 'Self-Healing': Si falla X veces, intenta cambiar de cámara automáticamente.
+        Captura un frame de forma thread-safe.
         """
-        if not self.cap or not self.cap.isOpened():
-            return None
-        
-        # Leemos el frame.
-        ret, frame = self.cap.read()
+        with self._cap_lock:
+            if not self.cap or not self.cap.isOpened():
+                return None
+            ret, frame = self.cap.read()
 
-        # Aplicamos el efecto espejo si es necesario.
+        if not ret or frame is None:
+            return None
+
         if self.mirror_mode:
             frame = cv2.flip(frame, 1)
-            
+
         return frame
 
     @staticmethod
@@ -136,11 +139,10 @@ class CameraService:
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.request_width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.request_height)
 
-                # Liberamos la anterior si existía en la instancia
-                if self.cap:
-                    self.cap.release()
-
-                self.cap = cap
+                with self._cap_lock:
+                    if self.cap:
+                        self.cap.release()
+                    self.cap = cap
                 return True
             else:
                 # Si llegamos aquí y sigue sin abrir, liberamos hardware para que se apague la luz

@@ -102,7 +102,7 @@ class MqttService:
             logger.warning(f"Reporting incident to MQTT: {json.dumps(payload)}")
 
             target_topic = self.mqtt_manager.config.error_topic
-            return self.mqtt_manager.publish(target_topic, payload)
+            return self.mqtt_manager.publish_message(topic=target_topic, payload=json.dumps(payload))
 
         except Exception as e:
             logger.error(f"Failed to send incident report: {e}")
