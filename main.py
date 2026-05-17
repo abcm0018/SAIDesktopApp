@@ -5,7 +5,7 @@ import os
 import flet as ft
 from dotenv import load_dotenv
 
-from services.audit_service import AuditService
+from src.services.audit_service import AuditService
 from src.config.app_config import AppConfig
 from src.config.mqtt_config import MqttConfig
 from src.config.routes import AppRoutes
