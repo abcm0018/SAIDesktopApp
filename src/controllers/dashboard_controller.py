@@ -5,6 +5,7 @@ import time
 import flet as ft
 
 from src.config.app_config import AppConfig
+from src.config.routes import AppRoutes
 from src.services.pallet_processing_service import PalletProcessingService
 
 logger = logging.getLogger(__name__)
@@ -88,13 +89,32 @@ class DashboardController:
             self._start_system()
         else:
             self._stop_system()
+            # Para parada normal desde UI: join en background para no bloquear
+            threading.Thread(target=self._join_threads, daemon=True, name="sai-shutdown").start()
 
     def logout(self):
-        """Maneja el cierre de sesión."""
+        """Cierre de sesión completo: para el sistema, limpia sesión y navega."""
         self._stop_system()
-        self.auth_service.logout()
-        # Aquí le dirías al enrutador principal que cambie a la pantalla de login
-        self.page.go("/login")
+
+        # Para logout: join sincrónico para que los hilos terminen antes de limpiar la sesión
+        self._join_threads()
+
+        try:
+            self.mqtt_service.mqtt_manager.disconnect()
+            logger.info("MQTT desconectado al cerrar sesión")
+        except Exception as e:
+            logger.warning("Error al desconectar MQTT: %s", e)
+
+        user = self.page.session.get("user")
+        if user:
+            self.auth_service.cerrar_sesion(user)
+
+        try:
+            self.page.session.remove("user")
+        except KeyError:
+            logger.warning("La clave 'user' ya había sido eliminada de la sesión")
+
+        self.page.go(AppRoutes.LOGIN)
 
         # -------------------------------------------------------------------------
 
@@ -135,10 +155,6 @@ class DashboardController:
             self.frame_queue.queue.clear()
 
         self.view.detener_animacion_escaneo()
-
-        # Esperar el drenado de hilos en background para no bloquear la UI.
-        # Los hilos son non-daemon: el proceso no termina hasta que ellos acaben.
-        threading.Thread(target=self._join_threads, daemon=True, name="sai-shutdown").start()
 
     def _join_threads(self):
         pairs = [
@@ -245,7 +261,8 @@ class DashboardController:
         self.view.mostrar_estado_exito()
 
         # Encolar publicación MQTT con espera de hasta 5s para que el sender drene
-        empleado = self.auth_service.get_current_user() or "0000"
+        user = self.page.session.get("user")
+        empleado = getattr(user, 'employee_number', '0000') if user else '0000'
         try:
             self._mqtt_queue.put({
                 "palet_data": palet,
@@ -253,13 +270,12 @@ class DashboardController:
                 "station_code": self.page.session.get("station_code"),
                 "station_cam_id": self.page.session.get("camera_id"),
             }, block=True, timeout=5.0)
+            logger.info("Palet SSCC=%s encolado para envío MQTT", palet.sscc)
         except queue.Full:
             logger.critical(
                 "Cola MQTT llena tras 5s de espera; palet SSCC=%s NO enviado. "
                 "Revisar conectividad con el broker.", palet.sscc
             )
-
-        self.audit_service.log_scan_success(palet.sscc)
 
         # Cooldown interruptible: se desbloquea si el sistema se detiene
         self._cooldown_event.clear()
@@ -274,7 +290,15 @@ class DashboardController:
         self.lectura_bloqueada = True
 
         self.view.mostrar_estado_error_timeout()
-        self.audit_service.log_scan_timeout("NO_SSCC_DETECTED")
+
+        palet = self.pallet_service.get_palet_actual()
+        user = self.page.session.get("user")
+        employee_number = getattr(user, 'employee_number', 'UNKNOWN') if user else 'UNKNOWN'
+        threading.Thread(
+            target=self.audit_service.registrar_incidencia,
+            args=(employee_number, palet, "TIMEOUT_ETIQUETA_DAÑADA"),
+            daemon=True,
+        ).start()
 
         self._cooldown_event.clear()
         self._cooldown_event.wait(timeout=AppConfig.POST_SEND_DELAY_SEC)

@@ -1,5 +1,4 @@
 import logging
-import queue
 import threading
 import time
 import flet as ft
@@ -14,10 +13,10 @@ from src.services.mqtt_service import MqttService
 from src.domain.palet import PaletScanData
 from src.config.routes import AppRoutes
 from src.ui import design_system as ds
+from src.controllers.dashboard_controller import DashboardController
 
 logger = logging.getLogger(__name__)
 
-# Imagen vacía (pixel transparente) para cuando la cámara está apagada
 PLACEHOLDER_IMG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 
 
@@ -34,34 +33,17 @@ class DashboardView(ft.Column):
     ):
         super().__init__()
         self.page = page
-        self.auth_service = auth_service
-        self.camera_service = camera_service
-        self.yolo_service = yolo_service
-        self.scanner_service = scanner_service
         self.mqtt_service = mqtt_service
-        self.audit_service = audit_service
 
-        # --- Estado interno ---
+        # --- Estado UI ---
         self.station_code = self.page.session.get("station_code")
         self.camera_id = self.page.session.get("camera_id")
         self.user = self.page.session.get("user")
-
-        self.en_periodo_gracia = False
-        self.tiempo_inicio_gracia = 0
-        self.segundos_gracia = AppConfig.READ_TIMEOUT_SEC
+        self.animando_linea = False
+        self._anim_thread: threading.Thread | None = None
 
         self.expand = True
         self.spacing = 0
-        self.escaneando = False      # Flag canónico: controla AMBOS hilos de fondo
-        self.animando_linea = False
-        self.lectura_bloqueada = False
-
-        self.palet_acumulado = PaletScanData()
-        self.frame_queue = queue.Queue(maxsize=1)
-
-        self._camera_thread: threading.Thread | None = None
-        self._processing_thread: threading.Thread | None = None
-        self._anim_thread: threading.Thread | None = None
 
         # --- Construcción de UI ---
         self.header = self._build_header()
@@ -76,6 +58,18 @@ class DashboardView(ft.Column):
                 spacing=0
             )
         ]
+
+        # --- Controlador (se crea después de la UI para poder pasarse como view=self) ---
+        self.controller = DashboardController(
+            page=page,
+            view=self,
+            auth_service=auth_service,
+            camera_service=camera_service,
+            yolo_service=yolo_service,
+            scanner_service=scanner_service,
+            mqtt_service=mqtt_service,
+            audit_service=audit_service,
+        )
 
     # --------------------------------------------------------------------------
     # SECCIÓN 1: BUILDERS
@@ -153,6 +147,14 @@ class DashboardView(ft.Column):
             animate_offset=ft.Animation(duration=1500, curve=ft.AnimationCurve.EASE_IN_OUT),
         )
 
+        self.switch_activar = ft.Switch(
+            label="Activar puesto",
+            label_style=ft.TextStyle(color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
+            value=False,
+            active_color=ds.ACCENT_GREEN,
+            on_change=self._toggle_camara
+        )
+
         stack = ft.Stack(
             expand=True,
             alignment=ft.alignment.center,
@@ -178,13 +180,7 @@ class DashboardView(ft.Column):
                 ft.Container(
                     alignment=ft.alignment.bottom_center,
                     padding=20,
-                    content=ft.Switch(
-                        label="Activar puesto",
-                        label_style=ft.TextStyle(color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
-                        value=False,
-                        active_color=ds.ACCENT_GREEN,
-                        on_change=self._toggle_camara
-                    )
+                    content=self.switch_activar
                 )
             ]
         )
@@ -218,8 +214,6 @@ class DashboardView(ft.Column):
         self.txt_fechas = ft.Text("Caducidad: -", size=ds.SIZE_LABEL, color=ds.TEXT_SECONDARY)
         self.txt_produccion = ft.Text("Prod: -", size=ds.SIZE_LABEL, color=ds.TEXT_SECONDARY)
 
-        self.txt_envio_msg = ft.Text("Enviando datos...", color=ds.TEXT_SECONDARY)
-
         self.info_container = ft.Column(
             opacity=0.3,
             animate_opacity=300,
@@ -232,22 +226,6 @@ class DashboardView(ft.Column):
                 self.txt_fechas,
                 self.txt_produccion
             ]
-        )
-
-        self.envio_status = ft.Container(
-            visible=False,
-            animate_opacity=300,
-            padding=15,
-            border_radius=ds.RADIUS_MD,
-            bgcolor=ds.SURFACE_ELEVATED,
-            content=ft.Row(
-                controls=[
-                    ft.ProgressRing(width=20, height=20, stroke_width=2, color=ds.ACCENT_BLUE),
-                    self.txt_envio_msg
-                ],
-                spacing=10,
-                alignment=ft.MainAxisAlignment.CENTER
-            )
         )
 
         content = ft.Column(
@@ -268,8 +246,6 @@ class DashboardView(ft.Column):
                 ),
                 ft.Divider(height=20, color=ft.Colors.TRANSPARENT),
                 self.info_container,
-                ft.Divider(height=20, color=ft.Colors.TRANSPARENT),
-                self.envio_status
             ],
             scroll=ft.ScrollMode.AUTO,
             horizontal_alignment=ft.CrossAxisAlignment.CENTER
@@ -302,91 +278,141 @@ class DashboardView(ft.Column):
         )
 
     # --------------------------------------------------------------------------
-    # SECCIÓN 2: CONTROL DE FLUJO Y EVENTOS
+    # SECCIÓN 2: EVENTOS UI
     # --------------------------------------------------------------------------
 
     def _toggle_camara(self, e):
-        activar = e.control.value
-        if activar:
-            self._iniciar_flujo_camara()
-        else:
-            self._detener_flujo_camara()
+        self.controller.toggle_camera(e.control.value)
 
     def _logout(self, e):
-        logger.debug(f"Evento de cierre de sesión: {e}")
-        self._detener_flujo_camara()
+        self.controller.logout()
 
-        _JOIN_TIMEOUT = 1.0
-        for hilo in (self._camera_thread, self._processing_thread, self._anim_thread):
-            if hilo is not None and hilo.is_alive():
-                hilo.join(timeout=_JOIN_TIMEOUT)
+    # --------------------------------------------------------------------------
+    # SECCIÓN 3: INTERFAZ DEL CONTROLADOR
+    # Estos métodos son llamados por DashboardController desde sus hilos.
+    # Todos los updates de UI usan try/except para tolerar desconexiones de página.
+    # --------------------------------------------------------------------------
 
+    def mostrar_error(self, mensaje: str):
+        """Muestra un error en el panel de estado."""
+        self.txt_estado.value = f"Error: {mensaje}"
+        self.txt_estado.color = ds.ACCENT_RED
         try:
-            self.mqtt_service.mqtt_manager.disconnect()
-            logger.info("MQTT desconectado al cerrar sesión")
-        except Exception as ex:
-            logger.warning(f"Error al desconectar MQTT: {ex}")
+            self.txt_estado.update()
+        except Exception:
+            pass
 
-        if self.user:
-            self.auth_service.cerrar_sesion(self.user)
-
+    def apagar_switch(self):
+        """Desactiva el switch de activación del puesto."""
+        self.switch_activar.value = False
         try:
-            self.page.session.remove('user')
-        except KeyError:
-            logger.warning("La clave 'user' ya había sido eliminada de la sesión")
+            self.switch_activar.update()
+        except Exception:
+            pass
 
-        self.page.go(AppRoutes.LOGIN)
-
-    def _iniciar_flujo_camara(self):
+    def iniciar_animacion_escaneo(self):
+        """Transiciona la UI al estado 'escaneando' e inicia la animación de línea."""
         self._conectar_mqtt()
 
-        self.camera_service.iniciar_camara()
-        self.escaneando = True      # Habilita AMBOS hilos (cámara + procesamiento)
-        self.animando_linea = True
-        self.lectura_bloqueada = False
         self.txt_cam_status.value = self.camera_id
         self.txt_cam_status.color = ds.ACCENT_GREEN
         self.status_icon.name = ft.Icons.VIDEOCAM
         self.status_icon.color = ds.ACCENT_GREEN
-
-        self.page.update()
-
-        with self.frame_queue.mutex:
-            self.frame_queue.queue.clear()
-
+        self.img_video.src_base64 = PLACEHOLDER_IMG
         self.txt_estado.value = "Buscando códigos GS1..."
         self.txt_estado.color = ds.ACCENT_BLUE
-        self.txt_estado.update()
+        try:
+            self.page.update()
+        except Exception:
+            pass
 
-        self._camera_thread = threading.Thread(target=self._thread_camera_loop, daemon=True)
-        self._processing_thread = threading.Thread(target=self._thread_processing_loop, daemon=True)
-        self._anim_thread = threading.Thread(target=self._thread_animacion, daemon=True)
-        self._camera_thread.start()
-        self._processing_thread.start()
+        self.animando_linea = True
+        self._anim_thread = threading.Thread(
+            target=self._thread_animacion, daemon=True, name="sai-anim")
         self._anim_thread.start()
 
-    def _detener_flujo_camara(self):
-        self.escaneando = False
+    def detener_animacion_escaneo(self):
+        """Transiciona la UI al estado 'pausa' y detiene la animación de línea."""
         self.animando_linea = False
-        self.camera_service.detener_camara()
 
         self.txt_cam_status.value = "PAUSA"
         self.txt_cam_status.color = ds.TEXT_MUTED
         self.status_icon.name = ft.Icons.VIDEOCAM_OFF
         self.status_icon.color = ds.TEXT_MUTED
-
         self.img_video.src_base64 = PLACEHOLDER_IMG
         self.txt_estado.value = "Cámara en espera"
-        self.page.update()
+        try:
+            self.page.update()
+        except Exception:
+            pass
 
-    def _limpiar_datos(self):
-        self.lectura_bloqueada = False
+    def mostrar_frame_video(self, frame_b64: str):
+        """Actualiza el preview de cámara con el frame codificado en Base64."""
+        if frame_b64:
+            self.img_video.src_base64 = frame_b64
+            try:
+                self.img_video.update()
+            except Exception:
+                pass
 
-        with self.frame_queue.mutex:
-            self.frame_queue.queue.clear()
+    def actualizar_datos_palet(self, palet: PaletScanData):
+        """Actualiza el panel derecho con los datos del palé acumulado."""
+        if palet.sscc:
+            self.txt_sscc.value = palet.sscc
+            self.txt_sscc.color = ds.ACCENT_BLUE
 
-        self.palet_acumulado = PaletScanData()
+        ean_val = getattr(palet, 'ean', None)
+        if ean_val:
+            self.txt_producto.value = f"EAN: {ean_val}"
+            self.txt_producto.weight = ft.FontWeight.BOLD
 
+        if palet.batch_number:
+            self.txt_lote.value = f"Lote: {palet.batch_number}"
+            self.txt_lote.color = ds.TEXT_PRIMARY
+
+        if palet.product_use_by_date:
+            self.txt_fechas.value = f"Caducidad: {palet.product_use_by_date}"
+
+        prod_str = []
+        if palet.packaging_date:
+            prod_str.append(palet.packaging_date)
+        if palet.production_time:
+            prod_str.append(palet.production_time)
+        if prod_str:
+            self.txt_produccion.value = f"Prod: {' '.join(prod_str)}"
+
+        self.info_container.opacity = 1.0
+        try:
+            self.info_container.update()
+        except Exception:
+            pass
+
+    def mostrar_estado_exito(self):
+        """Muestra el estado visual de palé completado (verde)."""
+        self.txt_estado.value = "PALET COMPLETADO"
+        self.txt_estado.color = ds.ACCENT_GREEN
+        self.animando_linea = False
+        self.scan_line.offset = ft.Offset(1.2, 0)
+        self.scan_line.bgcolor = ds.ACCENT_GREEN
+        try:
+            self.txt_estado.update()
+            self.scan_line.update()
+        except Exception:
+            pass
+
+    def mostrar_estado_error_timeout(self):
+        """Muestra el estado visual de etiqueta dañada / timeout (rojo)."""
+        self.txt_estado.value = "ETIQUETA DAÑADA"
+        self.txt_estado.color = ds.ACCENT_RED
+        self.scan_line.bgcolor = ds.ACCENT_RED
+        try:
+            self.txt_estado.update()
+            self.scan_line.update()
+        except Exception:
+            pass
+
+    def limpiar_datos_palet(self):
+        """Resetea todos los campos del panel de datos para la siguiente lectura."""
         self.txt_sscc.value = "---"
         self.txt_sscc.color = ds.ACCENT_BLUE
         self.txt_producto.value = "EAN: -"
@@ -395,26 +421,26 @@ class DashboardView(ft.Column):
         self.txt_lote.color = ds.TEXT_SECONDARY
         self.txt_fechas.value = "Caducidad: -"
         self.txt_produccion.value = "Prod: -"
-
         self.info_container.opacity = 0.3
-        self.info_container.update()
-
         self.txt_estado.value = "Buscando códigos GS1..."
         self.txt_estado.color = ds.ACCENT_BLUE
-        self.txt_estado.update()
-
         self.scan_line.bgcolor = ds.ACCENT_BLUE
-        self.scan_line.update()
+        self.scan_line.offset = ft.Offset(-1.2, 0)
+        try:
+            self.info_container.update()
+            self.txt_estado.update()
+            self.scan_line.update()
+        except Exception:
+            pass
 
-        self.envio_status.visible = False
-        self.envio_status.update()
-
-        if self.escaneando and not self.animando_linea:
+        if not self.animando_linea:
             self.animando_linea = True
-            threading.Thread(target=self._thread_animacion, daemon=True).start()
+            self._anim_thread = threading.Thread(
+                target=self._thread_animacion, daemon=True, name="sai-anim")
+            self._anim_thread.start()
 
     # --------------------------------------------------------------------------
-    # SECCIÓN: GESTIÓN MQTT
+    # SECCIÓN 4: MQTT STATUS
     # --------------------------------------------------------------------------
 
     def _conectar_mqtt(self):
@@ -441,310 +467,24 @@ class DashboardView(ft.Column):
             self.mqtt_status_icon.name = ft.Icons.CLOUD_OFF
             self.mqtt_status_icon.color = ds.ACCENT_RED
             self.mqtt_status_icon.tooltip = "MQTT desconectado"
-
         try:
             self.mqtt_status_icon.update()
         except Exception as e:
             logger.warning(f"Error actualizando icono MQTT: {e}")
 
-    def _enviar_palet_mqtt(self):
-        def _enviar_async():
-            try:
-                self.envio_status.visible = True
-                self.txt_envio_msg.value = "Enviando datos..."
-                self.envio_status.update()
-
-                employee_number = getattr(self.user, 'employee_number', 'UNKNOWN')
-
-                enviado = self.mqtt_service.enviar_datos_palet(
-                    palet_data=self.palet_acumulado,
-                    employee_number=employee_number,
-                    station_code=self.station_code,
-                    station_cam_id=self.camera_id,
-                )
-
-                if enviado:
-                    logger.info(f"Palet acumulado {self.palet_acumulado.sscc} enviado exitosamente")
-                    self._mostrar_resultado_envio(exito=True)
-                else:
-                    logger.error(f"Error al enviar palet {self.palet_acumulado.sscc}")
-                    self._mostrar_resultado_envio(exito=False)
-
-            except Exception as e:
-                logger.exception(f"Error crítico enviando palet: {e}")
-                self._mostrar_resultado_envio(exito=False)
-
-        threading.Thread(target=_enviar_async, daemon=True).start()
-
-    def _mostrar_resultado_envio(self, exito: bool):
-        if exito:
-            self.envio_status.bgcolor = ft.Colors.with_opacity(0.12, ft.Colors.GREEN)
-            self.envio_status.content = ft.Column(
-                controls=[
-                    ft.Icon(ft.Icons.CHECK_CIRCLE, color=ds.ACCENT_GREEN, size=40),
-                    ft.Text(
-                        "Datos enviados correctamente",
-                        color=ds.ACCENT_GREEN,
-                        weight=ft.FontWeight.BOLD,
-                        text_align=ft.TextAlign.CENTER
-                    ),
-                    ft.Text(
-                        "Escanee el siguiente palet",
-                        color=ds.TEXT_SECONDARY,
-                        size=12,
-                        text_align=ft.TextAlign.CENTER
-                    )
-                ],
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=5
-            )
-        else:
-            self.envio_status.bgcolor = ft.Colors.with_opacity(0.12, ft.Colors.RED)
-            self.envio_status.content = ft.Column(
-                controls=[
-                    ft.Icon(ft.Icons.ERROR, color=ds.ACCENT_RED, size=40),
-                    ft.Text(
-                        "Error al enviar datos",
-                        color=ds.ACCENT_RED,
-                        weight=ft.FontWeight.BOLD,
-                        text_align=ft.TextAlign.CENTER
-                    ),
-                    ft.Text(
-                        "Verifique la conexión MQTT",
-                        color=ds.TEXT_SECONDARY,
-                        size=12,
-                        text_align=ft.TextAlign.CENTER
-                    )
-                ],
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                spacing=5
-            )
-
-        self.envio_status.update()
-
-        if exito:
-            def _auto_limpiar():
-                time.sleep(3)
-                if self.escaneando:
-                    self._limpiar_datos()
-
-            threading.Thread(target=_auto_limpiar, daemon=True).start()
-
-    def _handle_scan_timeout(self):
-        logger.warning(f"Scan Timeout ({AppConfig.READ_TIMEOUT_SEC}s). Reporting damaged label.")
-
-        self.palet_acumulado.station_id = self.station_code
-        self.palet_acumulado.camera_id = self.camera_id
-
-        if self.palet_acumulado.sscc is None:
-            employee_number = getattr(self.user, 'employee_number', 'UNKNOWN')
-
-            threading.Thread(
-                target=self.audit_service.registrar_incidencia,
-                args=(employee_number, self.palet_acumulado, "TIMEOUT_ETIQUETA_DAÑADA"),
-                daemon=True
-            ).start()
-
-            self.txt_estado.value = "ETIQUETA DAÑADA"
-            self.txt_estado.color = ds.ACCENT_RED
-            self.scan_line.bgcolor = ds.ACCENT_RED
-            try:
-                self.txt_estado.update()
-                self.scan_line.update()
-            except Exception:
-                pass
-
-            time.sleep(AppConfig.POST_SEND_DELAY_SEC)
-
-        else:
-            logger.info(
-                f"Scan Timeout alcanzado. Palet con SSCC ({self.palet_acumulado.sscc}) omitido de auditoría de daños.")
-
-        self._limpiar_datos()
-
-        self.txt_estado.value = "ESPERANDO NUEVA ETIQUETA"
-        self.txt_estado.color = ds.TEXT_PRIMARY
-        self.scan_line.bgcolor = ds.ACCENT_BLUE
-        try:
-            self.txt_estado.update()
-            self.scan_line.update()
-        except Exception:
-            pass
-
     # --------------------------------------------------------------------------
-    # SECCIÓN 3: LÓGICA DE HILOS
+    # SECCIÓN 5: ANIMACIÓN DE LÍNEA DE ESCANEO (UI pura)
     # --------------------------------------------------------------------------
-
-    _UI_PREVIEW_INTERVAL = 0.10  # Actualizar preview a ~10 fps (suficiente para UI industrial)
-
-    def _thread_camera_loop(self):
-        time.sleep(0.5)
-        last_ui_update = 0.0
-
-        while self.escaneando:
-            frame_hd = self.camera_service.obtener_frame()
-
-            if frame_hd is None:
-                time.sleep(0.02)
-                continue
-
-            # Encolar frame para procesamiento IA lo antes posible
-            if not self.lectura_bloqueada:
-                try:
-                    self.frame_queue.put_nowait(frame_hd)
-                except queue.Full:
-                    pass
-
-            # Limitar encode + renderizado de preview a 10 fps
-            now = time.monotonic()
-            if now - last_ui_update >= self._UI_PREVIEW_INTERVAL:
-                frame_b64 = self.camera_service.convertir_numpy_a_base64(
-                    frame_hd, quality=50, width_resize=AppConfig.VIDEO_PREVIEW_WIDTH
-                )
-                if frame_b64:
-                    self.img_video.src_base64 = frame_b64
-                    try:
-                        self.img_video.update()  # Solo actualiza el control de imagen, no toda la página
-                    except Exception:
-                        pass
-                last_ui_update = now
-
-    def _thread_processing_loop(self):
-        while self.escaneando:  # Mismo flag que _thread_camera_loop
-
-            if (self.palet_acumulado.scan_start_time is not None
-                    and self.palet_acumulado.has_timed_out(AppConfig.READ_TIMEOUT_SEC)):
-
-                if self.palet_acumulado.sscc:
-                    logger.info(f"Fin de los 5s de parada. Enviando palet SSCC: {self.palet_acumulado.sscc}")
-                    self._finalizar_palet()
-                else:
-                    logger.warning("Fin de los 5s de parada sin detectar SSCC. Marcando como ETIQUETA DAÑADA.")
-                    self._handle_scan_timeout()
-
-                with self.frame_queue.mutex:
-                    self.frame_queue.queue.clear()
-
-                continue
-
-            try:
-                frame = self.frame_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            if self.lectura_bloqueada:
-                self.frame_queue.task_done()
-                continue
-
-            try:
-                rois_detectados = self.yolo_service.detectar(frame)
-
-                if rois_detectados is None or len(rois_detectados) > 0:
-                    self.palet_acumulado.init_timeout()
-
-                scan_result_dto = self.scanner_service.procesar_zonas(frame, rois_detectados)
-
-                if self._fusionar_datos(scan_result_dto):
-                    self._actualizar_ui_progreso()
-
-                    if self.palet_acumulado.is_fully_captured():
-                        logger.info("Lectura al 100% completada antes de 5s. Finalizando anticipadamente.")
-                        self._finalizar_palet()
-                        with self.frame_queue.mutex:
-                            self.frame_queue.queue.clear()
-
-            except Exception as e:
-                logger.error(f"Error en hilo de procesamiento IA: {e}")
-            finally:
-                self.frame_queue.task_done()
-
-    def _fusionar_datos(self, nuevo_dato: PaletScanData) -> bool:
-        acc = self.palet_acumulado
-        hubo_cambios = False
-
-        if nuevo_dato.sscc and not acc.sscc:
-            acc.sscc = nuevo_dato.sscc
-            hubo_cambios = True
-        if nuevo_dato.ean and not acc.ean:
-            acc.ean = nuevo_dato.ean
-            hubo_cambios = True
-        if nuevo_dato.batch_number and not acc.batch_number:
-            acc.batch_number = nuevo_dato.batch_number
-            hubo_cambios = True
-        if nuevo_dato.product_use_by_date and not acc.product_use_by_date:
-            acc.product_use_by_date = nuevo_dato.product_use_by_date
-            hubo_cambios = True
-        if nuevo_dato.packaging_date and not acc.packaging_date:
-            acc.packaging_date = nuevo_dato.packaging_date
-            hubo_cambios = True
-        if nuevo_dato.production_time and not acc.production_time:
-            acc.production_time = nuevo_dato.production_time
-            hubo_cambios = True
-
-        if hubo_cambios and not acc._fully_captured:
-            acc._fully_captured = bool(
-                acc.sscc and acc.ean and acc.batch_number
-                and acc.product_use_by_date and acc.packaging_date
-            )
-
-        return hubo_cambios
-
-    def _actualizar_ui_progreso(self):
-        p = self.palet_acumulado
-
-        if p.sscc:
-            self.txt_sscc.value = p.sscc
-            self.txt_sscc.color = ds.ACCENT_BLUE
-
-        ean_val = getattr(p, 'ean', None) or getattr(p, 'gtin', None)
-        if ean_val:
-            self.txt_producto.value = f"EAN: {ean_val}"
-            self.txt_producto.weight = ft.FontWeight.BOLD
-
-        if p.batch_number:
-            self.txt_lote.value = f"Lote: {p.batch_number}"
-            self.txt_lote.color = ds.TEXT_PRIMARY
-
-        if p.product_use_by_date:
-            self.txt_fechas.value = f"Caducidad: {p.product_use_by_date}"
-
-        prod_str = []
-        if p.packaging_date: prod_str.append(p.packaging_date)
-        if p.production_time: prod_str.append(p.production_time)
-        if prod_str:
-            self.txt_produccion.value = f"Prod: {' '.join(prod_str)}"
-
-        self.info_container.opacity = 1.0
-        self.info_container.update()
-
-    def _finalizar_palet(self):
-        self.lectura_bloqueada = True
-
-        self.txt_estado.value = "PALET COMPLETADO"
-        self.txt_estado.color = ds.ACCENT_GREEN
-        self.animando_linea = False
-        self.scan_line.offset = ft.Offset(1.2, 0)
-        self.scan_line.bgcolor = ds.ACCENT_GREEN
-
-        try:
-            self.txt_estado.update()
-            self.scan_line.update()
-        except Exception:
-            pass
-
-        logger.info(f"Palet SSCC: {self.palet_acumulado.sscc} completado")
-        self._enviar_palet_mqtt()
 
     def _thread_animacion(self):
         direccion_abajo = True
-        while self.animando_linea and self.escaneando:
+        while self.animando_linea:
             nuevo_offset = ft.Offset(1.2, 0) if direccion_abajo else ft.Offset(-1.2, 0)
             self.scan_line.offset = nuevo_offset
             try:
                 self.scan_line.update()
             except Exception as e:
-                logger.debug(f"Animación detenida (UI no accesible): {e}")
+                logger.debug(f"Animación detenida (página no accesible): {e}")
                 break
-
             direccion_abajo = not direccion_abajo
             time.sleep(1.6)
