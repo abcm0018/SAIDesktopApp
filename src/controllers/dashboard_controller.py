@@ -21,7 +21,8 @@ class DashboardController:
             yolo_service,
             scanner_service,
             mqtt_service,
-            audit_service
+            audit_service,
+            image_storage_service,
     ):
         self.page = page
         self.view = view
@@ -33,13 +34,13 @@ class DashboardController:
         self.scanner_service = scanner_service
         self.mqtt_service = mqtt_service
         self.audit_service = audit_service
+        self.image_storage_service = image_storage_service
 
         self.pallet_service = PalletProcessingService()
 
         # Estado del controlador — thread-safe mediante threading.Event
         self._scanning = threading.Event()
         self._blocked = threading.Event()
-        self.frame_queue = queue.Queue(maxsize=AppConfig.QUEUE_MAX_SIZE)
 
         # Cola de publicaciones MQTT — procesada en hilo dedicado
         self._mqtt_queue: queue.Queue = queue.Queue(maxsize=8)
@@ -50,10 +51,6 @@ class DashboardController:
         self.camera_thread = None
         self.processing_thread = None
         self._mqtt_thread = None
-
-        # Telemetría de frames descartados
-        self._frames_dropped = 0
-        self._FRAME_DROP_WARN_EVERY = 30
 
     # -------------------------------------------------------------------------
     # PROPIEDADES THREAD-SAFE
@@ -136,7 +133,7 @@ class DashboardController:
         self.camera_thread = threading.Thread(
             target=self._camera_capture_loop, daemon=False, name="sai-camera")
         self.processing_thread = threading.Thread(
-            target=self._processing_loop, daemon=False, name="sai-processing")
+            target=self._processing_loop_v3, daemon=False, name="sai-processing")
         self._mqtt_thread = threading.Thread(
             target=self._mqtt_sender_loop, daemon=False, name="sai-mqtt")
 
@@ -150,9 +147,6 @@ class DashboardController:
 
         if self.camera_service:
             self.camera_service.detener_camara()
-
-        with self.frame_queue.mutex:
-            self.frame_queue.queue.clear()
 
         self.view.detener_animacion_escaneo()
 
@@ -169,7 +163,7 @@ class DashboardController:
                     logger.warning("El hilo '%s' no terminó en %.1fs", thread.name, timeout)
 
     def _camera_capture_loop(self):
-        """Hilo Productor: Lee la cámara y mete frames en la cola."""
+        """Hilo de preview: alimenta el video de la UI. El procesamiento usa capturar_foto_hd()."""
         while self.is_scanning:
             frame = self.camera_service.obtener_frame()
             if frame is not None:
@@ -177,64 +171,51 @@ class DashboardController:
                     frame, quality=50, width_resize=AppConfig.VIDEO_PREVIEW_WIDTH
                 )
                 self.view.mostrar_frame_video(frame_b64)
-
-                if not self.lectura_bloqueada:
-                    try:
-                        self.frame_queue.put_nowait(frame)
-                        self._frames_dropped = 0
-                    except queue.Full:
-                        self._frames_dropped += 1
-                        if self._frames_dropped % self._FRAME_DROP_WARN_EVERY == 0:
-                            logger.warning(
-                                "Pipeline saturado: %d frames descartados acumulados. "
-                                "El procesamiento IA no sigue el ritmo de la cámara.",
-                                self._frames_dropped
-                            )
             else:
                 time.sleep(0.01)
 
-    def _processing_loop(self):
+    def _processing_loop_v3(self):
         """
-        Hilo Consumidor: Orquesta la IA y la Lógica de Negocio.
-        Es la versión limpia del método que reparamos anteriormente.
+        YOLO gate (320px) + procesar_zonas sobre el mismo frame.
+        El mismo frame se usa para detección y decodificación — sin desfase temporal.
+        CAP_PROP_BUFFERSIZE=1 (Phase 1) garantiza que obtener_frame() ya es fresco.
+        Las imágenes solo se persisten a disco en _handle_scan_timeout (diagnóstico).
         """
         while self.is_scanning:
-            # 1. EVALUAR WATCHDOG (5 Segundos de parada)
+            # 1. WATCHDOG
             if self.pallet_service.evaluar_watchdog(AppConfig.READ_TIMEOUT_SEC):
                 palet_actual = self.pallet_service.get_palet_actual()
-
                 if palet_actual.sscc:
-                    logger.info(f"Fin parada. Enviando palet SSCC: {palet_actual.sscc}")
+                    logger.info("Fin parada. Enviando palet SSCC: %s", palet_actual.sscc)
                     self._finalizar_palet()
                 else:
-                    logger.warning("Fin parada sin SSCC. Etiqueta Dañada.")
+                    logger.warning("Fin parada sin SSCC. Etiqueta dañada.")
                     self._handle_scan_timeout()
-
-                with self.frame_queue.mutex:
-                    self.frame_queue.queue.clear()
-                continue
-
-            # 2. OBTENER FRAME
-            try:
-                frame = self.frame_queue.get(timeout=0.5)
-            except queue.Empty:
                 continue
 
             if self.lectura_bloqueada:
-                self.frame_queue.task_done()
+                time.sleep(0.05)
                 continue
 
-            # 3. PROCESAMIENTO IA Y FUSIÓN
+            # 2. CAPTURAR FRAME — fresco gracias a CAP_PROP_BUFFERSIZE=1
+            frame = self.camera_service.obtener_frame()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            # 3. YOLO GATE @ 320px — detectar presencia de etiqueta
+            rois = self.yolo_service.detectar(frame)
+            if not rois:
+                time.sleep(0.05)   # sin etiqueta, ceder CPU sin I/O de disco
+                continue
+
+            # 4. ETIQUETA DETECTADA — iniciar timer
+            self.pallet_service.iniciar_temporizador()
+
+            # 5. DECODE con el mismo frame (ROIs y píxeles perfectamente alineados)
             try:
-                rois_detectados = self.yolo_service.detectar(frame)
-
-                if rois_detectados is None or len(rois_detectados) > 0:
-                    self.pallet_service.iniciar_temporizador()
-
-                scan_result_dto = self.scanner_service.procesar_zonas(frame, rois_detectados)
-
-                # Delega la lógica de negocio al servicio
-                hubo_cambios = self.pallet_service.procesar_nuevos_datos(scan_result_dto)
+                scan_result = self.scanner_service.procesar_zonas(frame, rois)
+                hubo_cambios = self.pallet_service.procesar_nuevos_datos(scan_result)
 
                 if hubo_cambios:
                     palet_actual = self.pallet_service.get_palet_actual()
@@ -242,13 +223,9 @@ class DashboardController:
 
                     if palet_actual.is_fully_captured():
                         self._finalizar_palet()
-                        with self.frame_queue.mutex:
-                            self.frame_queue.queue.clear()
 
             except Exception as e:
-                logger.error(f"Error en hilo de procesamiento: {e}")
-            finally:
-                self.frame_queue.task_done()
+                logger.error("Error en _processing_loop_v3: %s", e)
 
     # -------------------------------------------------------------------------
     # RESOLUCIÓN DE LA LECTURA
@@ -290,6 +267,13 @@ class DashboardController:
         self.lectura_bloqueada = True
 
         self.view.mostrar_estado_error_timeout()
+
+        # Capturar imagen diagnóstica del estado real de la etiqueta al expirar el watchdog
+        station_code = self.page.session.get("station_code") or "UNKNOWN"
+        gray_diag = self.camera_service.capturar_foto_hd()
+        if gray_diag is not None:
+            pending_path = self.image_storage_service.guardar_pendiente(gray_diag, station_code)
+            self.image_storage_service.marcar_fallido(pending_path)
 
         palet = self.pallet_service.get_palet_actual()
         user = self.page.session.get("user")

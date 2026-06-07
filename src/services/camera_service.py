@@ -87,6 +87,30 @@ class CameraService:
 
         return frame
 
+    def capturar_foto_hd(self, n_flush: int = 3) -> Optional[np.ndarray]:
+        """
+        Vacía el buffer del driver y devuelve el frame más reciente en escala de grises.
+
+        Usa grab() para descartar frames sin decodificarlos (~3x más rápido que read()),
+        garantizando que la imagen capturada refleja el estado actual de la cámara.
+
+        Args:
+            n_flush: número de frames a descartar antes de la captura real.
+        Returns:
+            numpy array (H×W, uint8, grayscale) o None si la cámara no responde.
+        """
+        with self._cap_lock:
+            if not self.cap or not self.cap.isOpened():
+                return None
+            for _ in range(n_flush):
+                self.cap.grab()
+            ret, frame = self.cap.read()
+
+        if not ret or frame is None:
+            return None
+
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
     @staticmethod
     def convertir_numpy_a_base64(frame: np.ndarray, quality: int = 60, width_resize: int = 640) -> Optional[str]:
         """
@@ -138,6 +162,7 @@ class CameraService:
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.request_width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.request_height)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
                 with self._cap_lock:
                     if self.cap:

@@ -41,7 +41,7 @@ class YoloService:
             img_rgb = frame[..., ::-1]
 
             # 2. Inferencia
-            results = self.model(img_rgb, size=640)
+            results = self.model(img_rgb, size=320)
 
             # 3. Post-procesamiento con numpy — evita la costosa conversión a pandas
             # Tensor shape: (N, 6) → [x1, y1, x2, y2, conf, cls]

@@ -65,7 +65,7 @@ class ScannerService:
                     # Intento 2: Si falla, aplicamos mejora de contraste (Lento pero robusto)
                     if not res:
                         roi_enhanced = self.clahe.apply(roi_crop)
-                        res = self._decodificar_recorte(roi_enhanced)
+                        res = self._decodificar_recorte(roi_enhanced, try_rotate=True)
                     
                     # Intento 3 (Opcional): Invertir color (útil para etiquetas negras con letras blancas)
                     # if not res:
@@ -104,14 +104,55 @@ class ScannerService:
 
         return palet_result
 
-    def _decodificar_recorte(self, imagen_gris: np.ndarray):
+    def escanear_imagen_completa(self, gray_img: np.ndarray) -> PaletScanData:
+        """
+        Escanea el frame completo en escala de grises sin ROIs previas de YOLO.
+
+        Estrategia de dos intentos:
+          1. Decodificación directa sin rotación (rápido, ~15-30 ms).
+          2. CLAHE + rotación si el primero falla (robusto, ~30-60 ms adicionales).
+
+        Args:
+            gray_img: imagen numpy (H×W, uint8, grayscale).
+        Returns:
+            PaletScanData con los campos decodificados (puede estar parcialmente relleno).
+        """
+        palet_result = PaletScanData()
+
+        if gray_img is None or gray_img.size == 0:
+            return palet_result
+
+        try:
+            resultados = self._decodificar_recorte(gray_img, try_rotate=False)
+
+            if not resultados:
+                img_enhanced = self.clahe.apply(gray_img)
+                resultados = self._decodificar_recorte(img_enhanced, try_rotate=True)
+
+            procesados = set()
+            for result in resultados:
+                raw_text = result.text
+                if raw_text in procesados or len(raw_text) < 5:
+                    continue
+                procesados.add(raw_text)
+                datos_parsed = GS1Parser.parse(raw_text)
+                if datos_parsed:
+                    palet_result.actualizar_datos(datos_parsed)
+                    logger.debug("Full-frame decode (%s): %s", result.format, raw_text)
+
+        except Exception as e:
+            logger.error("Error en escaneo full-frame: %s", e)
+
+        return palet_result
+
+    def _decodificar_recorte(self, imagen_gris: np.ndarray, try_rotate: bool = False):
         """Wrapper para llamar a zxing-cpp con los parámetros óptimos"""
         if imagen_gris.size == 0:
             return []
-            
+
         return zxingcpp.read_barcodes(
             imagen_gris,
             formats=self.formatos_validos,
-            try_rotate=True,
-            binarizer=zxingcpp.Binarizer.LocalAverage # LocalAverage es mejor para sombras que GlobalHistogram
+            try_rotate=try_rotate,
+            binarizer=zxingcpp.Binarizer.LocalAverage
         )

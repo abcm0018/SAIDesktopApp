@@ -14,6 +14,7 @@ from src.domain.palet import PaletScanData
 from src.config.routes import AppRoutes
 from src.ui import design_system as ds
 from src.controllers.dashboard_controller import DashboardController
+from src.services.image_storage_service import ImageStorageService
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,8 @@ class DashboardView(ft.Column):
             yolo_service: YoloService,
             scanner_service: ScannerService,
             mqtt_service: MqttService,
-            audit_service: AuditService
+            audit_service: AuditService,
+            image_storage_service: ImageStorageService,
     ):
         super().__init__()
         self.page = page
@@ -69,6 +71,7 @@ class DashboardView(ft.Column):
             scanner_service=scanner_service,
             mqtt_service=mqtt_service,
             audit_service=audit_service,
+            image_storage_service=image_storage_service,
         )
 
     # --------------------------------------------------------------------------

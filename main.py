@@ -16,6 +16,7 @@ from src.core.mqtt_manager import MqttManager
 from src.core.yolo_loader import YoloModelLoader
 from src.services.auth_service import AuthService
 from src.services.camera_service import CameraService
+from src.services.image_storage_service import ImageStorageService
 from src.services.mqtt_service import MqttService
 from src.services.scanner_service import ScannerService
 from src.services.yolo_service import YoloService
@@ -174,11 +175,18 @@ async def main(page: ft.Page):
         audit_service = AuditService(db_manager=db_manager)
         camera_service = CameraService(camera_id=device_camera_id)
         scanner_service = ScannerService()
-        
+
         # Inyectamos el manager en el servicio (según tu refactorización)
         mqtt_service = MqttService(mqtt_manager=mqtt_manager)
-        
+
         yolo_service = YoloService(model=modelo_yolo, conf_threshold=yolo_config.conf_threshold)
+
+        image_storage_service = ImageStorageService(
+            base_dir=AppConfig.CAPTURE_DIR,
+            failed_max_age_h=AppConfig.CAPTURE_FAILED_MAX_AGE_H,
+        )
+        image_storage_service.limpiar_al_inicio()
+        image_storage_service.iniciar_limpieza_periodica()
 
         logger.info("Servicios del Core inicializados correctamente.")
         
@@ -194,13 +202,14 @@ async def main(page: ft.Page):
         page.clean()
         
         my_router = Router(
-            page, 
-            auth_service=auth_service, 
-            camera_service=camera_service, 
+            page,
+            auth_service=auth_service,
+            camera_service=camera_service,
             scanner_service=scanner_service,
             yolo_service=yolo_service,
             mqtt_service=mqtt_service,
-            audit_service=audit_service
+            audit_service=audit_service,
+            image_storage_service=image_storage_service,
         )
         
         page.on_route_change = my_router.route_change

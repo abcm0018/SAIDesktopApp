@@ -33,3 +33,7 @@ class AppConfig:
     QUEUE_MAX_SIZE = _env_int("QUEUE_MAX_SIZE", 1000)
     POST_SEND_DELAY_SEC = _env_float("POST_SEND_DELAY_SEC", 2.0)
     VIDEO_PREVIEW_WIDTH = _env_int("VIDEO_PREVIEW_WIDTH", 640)
+
+    # Captura de imágenes (Fase 3)
+    CAPTURE_DIR = os.getenv("CAPTURE_DIR", "captures")
+    CAPTURE_FAILED_MAX_AGE_H = _env_int("CAPTURE_FAILED_MAX_AGE_H", 48)
