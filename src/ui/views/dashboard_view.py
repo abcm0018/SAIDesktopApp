@@ -403,6 +403,24 @@ class DashboardView(ft.Column):
         except Exception:
             pass
 
+    def mostrar_estado_borroso(self):
+        """Aviso transitorio de imagen borrosa (blur de movimiento): pide mantener el palet quieto."""
+        self.txt_estado.value = "Mantenga el palet quieto..."
+        self.txt_estado.color = ds.ACCENT_AMBER
+        try:
+            self.txt_estado.update()
+        except Exception:
+            pass
+
+    def reanudar_estado_escaneo(self):
+        """Restaura el texto de estado normal de escaneo tras recuperar nitidez."""
+        self.txt_estado.value = "Buscando códigos GS1..."
+        self.txt_estado.color = ds.ACCENT_BLUE
+        try:
+            self.txt_estado.update()
+        except Exception:
+            pass
+
     def mostrar_estado_error_timeout(self):
         """Muestra el estado visual de etiqueta dañada / timeout (rojo)."""
         self.txt_estado.value = "ETIQUETA DAÑADA"

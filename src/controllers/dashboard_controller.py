@@ -181,6 +181,9 @@ class DashboardController:
         CAP_PROP_BUFFERSIZE=1 (Phase 1) garantiza que obtener_frame() ya es fresco.
         Las imágenes solo se persisten a disco en _handle_scan_timeout (diagnóstico).
         """
+        frame_estaba_borroso = False
+        contador_borroso = 0
+
         while self.is_scanning:
             # 1. WATCHDOG
             if self.pallet_service.evaluar_watchdog(AppConfig.READ_TIMEOUT_SEC):
@@ -204,13 +207,34 @@ class DashboardController:
                 continue
 
             # 3. YOLO GATE @ 320px — detectar presencia de etiqueta
+            # (se ejecuta ANTES del gate de nitidez para no perder la señal de
+            # "hay una etiqueta presente" que arranca el watchdog — ver 4)
             rois = self.yolo_service.detectar(frame)
             if not rois:
                 time.sleep(0.05)   # sin etiqueta, ceder CPU sin I/O de disco
                 continue
 
-            # 4. ETIQUETA DETECTADA — iniciar timer
+            # 4. ETIQUETA DETECTADA — iniciar timer (watchdog cuenta desde aquí,
+            # independientemente de si el frame está borroso o no)
             self.pallet_service.iniciar_temporizador()
+
+            # 4.5 GATE DE NITIDEZ — evita gastar el reintento CLAHE en un frame con
+            # blur de movimiento que no tiene ninguna posibilidad de decodificar.
+            # El watchdog (paso 1) sigue corriendo igual mientras tanto.
+            if not self.scanner_service.es_frame_nitido(frame):
+                contador_borroso += 1
+                if not frame_estaba_borroso:
+                    self.view.mostrar_estado_borroso()
+                    frame_estaba_borroso = True
+                if contador_borroso % 20 == 0:
+                    logger.debug("Frame borroso consecutivo #%d, decodificación omitida", contador_borroso)
+                time.sleep(0.05)
+                continue
+
+            if frame_estaba_borroso:
+                self.view.reanudar_estado_escaneo()
+                frame_estaba_borroso = False
+                contador_borroso = 0
 
             # 5. DECODE con el mismo frame (ROIs y píxeles perfectamente alineados)
             try:

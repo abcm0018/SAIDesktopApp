@@ -104,6 +104,26 @@ class ScannerService:
 
         return palet_result
 
+    def es_frame_nitido(self, frame: np.ndarray) -> bool:
+        """
+        Evalúa si un frame tiene suficiente nitidez para intentar decodificar códigos.
+        Usa la varianza del Laplaciano como métrica barata de enfoque/desenfoque de
+        movimiento. Frames con blur de movimiento tienen varianza muy baja y no tienen
+        ninguna posibilidad de decodificar — se descartan antes de YOLO.
+        """
+        if frame is None or frame.size == 0:
+            return False
+
+        if len(frame.shape) == 3 and frame.shape[2] == 3:
+            gray_img = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        else:
+            gray_img = frame
+
+        varianza = cv2.Laplacian(gray_img, cv2.CV_64F).var()
+        logger.debug("Nitidez frame (var. Laplaciano): %.1f", varianza)
+
+        return varianza >= YoloConfig.BLUR_VAR_THRESHOLD
+
     def escanear_imagen_completa(self, gray_img: np.ndarray) -> PaletScanData:
         """
         Escanea el frame completo en escala de grises sin ROIs previas de YOLO.
