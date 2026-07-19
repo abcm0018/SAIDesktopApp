@@ -144,23 +144,34 @@ class DashboardController:
     def _stop_system(self):
         self.is_scanning = False
         self._cooldown_event.set()
-
-        if self.camera_service:
-            self.camera_service.detener_camara()
-
         self.view.detener_animacion_escaneo()
 
     def _join_threads(self):
-        pairs = [
+        # 1. Primero esperamos a los hilos que leen de la cámara (sai-camera,
+        #    sai-processing). En macOS (backend AVFoundation) liberar la cámara
+        #    mientras otro hilo sigue en cap.read() puede provocar un crash nativo
+        #    del proceso ("Python se ha cerrado inesperadamente"); Windows/DirectShow
+        #    tolera esa condición de carrera, macOS no.
+        camera_pairs = [
             (self.camera_thread, 2.0),
             (self.processing_thread, 2.0),
-            (self._mqtt_thread, 10.0),
         ]
-        for thread, timeout in pairs:
+        for thread, timeout in camera_pairs:
             if thread and thread.is_alive():
                 thread.join(timeout=timeout)
                 if thread.is_alive():
                     logger.warning("El hilo '%s' no terminó en %.1fs", thread.name, timeout)
+
+        # 2. Solo ahora, con la certeza de que ningún hilo sigue leyendo frames,
+        #    liberamos el hardware de la cámara.
+        if self.camera_service:
+            self.camera_service.detener_camara()
+
+        # 3. El hilo MQTT no toca la cámara, puede esperar/joinearse en cualquier orden.
+        if self._mqtt_thread and self._mqtt_thread.is_alive():
+            self._mqtt_thread.join(timeout=10.0)
+            if self._mqtt_thread.is_alive():
+                logger.warning("El hilo '%s' no terminó en %.1fs", self._mqtt_thread.name, 10.0)
 
     def _camera_capture_loop(self):
         """Hilo de preview: alimenta el video de la UI. El procesamiento usa capturar_foto_hd()."""
