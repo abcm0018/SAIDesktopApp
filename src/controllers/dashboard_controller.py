@@ -162,6 +162,16 @@ class DashboardController:
                 if thread.is_alive():
                     logger.warning("El hilo '%s' no terminó en %.1fs", thread.name, timeout)
 
+        # 1.5 _stop_system() ya puso el preview en placeholder, pero si sai-camera
+        #     estaba a mitad de mostrar_frame_video() en ese instante, su último
+        #     frame real "gana" y se queda pegado en la UI. Con el hilo ya
+        #     confirmadamente parado (join arriba), repetimos el reset para que
+        #     no quede ningún frame en vuelo pisando el placeholder.
+        try:
+            self.view.detener_animacion_escaneo()
+        except Exception:
+            pass
+
         # 2. Solo ahora, con la certeza de que ningún hilo sigue leyendo frames,
         #    liberamos el hardware de la cámara.
         if self.camera_service:
