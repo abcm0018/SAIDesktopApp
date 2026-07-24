@@ -12,6 +12,50 @@ class PalletProcessingService:
     def __init__(self):
         self.palet_acumulado = PaletScanData()
 
+        # Conteo temporal de los SSCC detectados durante la pasada actual.
+        self._candidatos_sscc = {}
+
+    def _confirmar_sscc(self, sscc: str):
+        """
+        Confirma el SSCC mediante varias lecturas.
+
+        Se acepta cuando:
+        - se ha leído al menos tres veces;
+        - tiene al menos dos lecturas de ventaja sobre el segundo candidato.
+        """
+        sscc = str(sscc).strip()
+
+        if not sscc:
+            return None
+
+        self._candidatos_sscc[sscc] = (
+                self._candidatos_sscc.get(sscc, 0) + 1
+        )
+
+        candidatos_ordenados = sorted(
+            self._candidatos_sscc.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+
+        mejor_sscc, mejores_votos = candidatos_ordenados[0]
+
+        segundos_votos = (
+            candidatos_ordenados[1][1]
+            if len(candidatos_ordenados) > 1
+            else 0
+        )
+
+        if mejores_votos >= 3 and mejores_votos - segundos_votos >= 2:
+            logger.info(
+                "SSCC confirmado: %s (%d lecturas)",
+                mejor_sscc,
+                mejores_votos,
+            )
+            return mejor_sscc
+
+        return None
+
     def procesar_nuevos_datos(self, nuevo_dato: PaletScanData) -> bool:
         """
         Algoritmo de fusión: Rellena los huecos del palet acumulado con los nuevos datos leídos.
@@ -25,8 +69,14 @@ class PalletProcessingService:
 
         # Acceso directo por atributo — evita getattr/setattr en el hot path (~30 fps)
         if nuevo_dato.sscc and not acc.sscc:
-            acc.sscc = nuevo_dato.sscc
-            hubo_cambios = True
+            sscc_confirmado = self._confirmar_sscc(
+                nuevo_dato.sscc
+            )
+
+            if sscc_confirmado:
+                acc.sscc = sscc_confirmado
+                self._candidatos_sscc.clear()
+                hubo_cambios = True
         if nuevo_dato.ean and not acc.ean:
             acc.ean = nuevo_dato.ean
             hubo_cambios = True
@@ -57,9 +107,13 @@ class PalletProcessingService:
         return self.palet_acumulado
 
     def reset_palet(self):
-        """Limpia el estado en memoria para prepararse para la siguiente caja."""
+        """Limpia el estado para prepararse para la siguiente lectura."""
         self.palet_acumulado = PaletScanData()
-        logger.debug("Estado del palet reseteado para nueva lectura.")
+        self._candidatos_sscc.clear()
+
+        logger.debug(
+            "Estado del palet reseteado para nueva lectura."
+        )
 
     def evaluar_watchdog(self, timeout_sec: float) -> bool:
         """

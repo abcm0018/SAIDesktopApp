@@ -202,8 +202,12 @@ class DashboardController:
         CAP_PROP_BUFFERSIZE=1 (Phase 1) garantiza que obtener_frame() ya es fresco.
         Las imágenes solo se persisten a disco en _handle_scan_timeout (diagnóstico).
         """
-        frame_estaba_borroso = False
-        contador_borroso = 0
+
+        ultimo_frame_procesado = -1
+        frames_enviados_procesamiento = 0
+        frames_omitidos = 0
+        inicio_medicion_procesamiento = time.monotonic()
+
 
         while self.is_scanning:
             # 1. WATCHDOG
@@ -221,11 +225,54 @@ class DashboardController:
                 time.sleep(0.05)
                 continue
 
-            # 2. CAPTURAR FRAME — fresco gracias a CAP_PROP_BUFFERSIZE=1
-            frame = self.camera_service.obtener_frame()
-            if frame is None:
+            # 2. OBTENER EL ÚLTIMO FOTOGRAMA DISPONIBLE
+            # CameraService ya dispone de un único hilo que realiza cap.read().
+            packet = self.camera_service.obtener_ultimo_frame()
+
+            if packet is None:
                 time.sleep(0.01)
                 continue
+
+            if packet.frame_id == ultimo_frame_procesado:
+                time.sleep(0.005)
+                continue
+
+            # Si el identificador ha avanzado más de una posición, significa que la
+            # cámara produjo fotogramas nuevos mientras el procesamiento estaba ocupado.
+            if (
+                    ultimo_frame_procesado >= 0
+                    and packet.frame_id > ultimo_frame_procesado + 1
+            ):
+                frames_omitidos += (
+                        packet.frame_id - ultimo_frame_procesado - 1
+                )
+
+            ultimo_frame_procesado = packet.frame_id
+            frame = packet.frame
+
+            frames_enviados_procesamiento += 1
+
+            ahora = time.monotonic()
+            tiempo_transcurrido = ahora - inicio_medicion_procesamiento
+
+            if tiempo_transcurrido >= 5.0:
+                fps_procesamiento = (
+                        frames_enviados_procesamiento / tiempo_transcurrido
+                )
+
+                logger.info(
+                    "Rendimiento del procesamiento: %.2f FPS; "
+                    "fotogramas enviados=%d, omitidos=%d "
+                    "en %.2f segundos.",
+                    fps_procesamiento,
+                    frames_enviados_procesamiento,
+                    frames_omitidos,
+                    tiempo_transcurrido,
+                )
+
+                frames_enviados_procesamiento = 0
+                frames_omitidos = 0
+                inicio_medicion_procesamiento = ahora
 
             # 3. YOLO GATE @ 320px — detectar presencia de etiqueta
             # (se ejecuta ANTES del gate de nitidez para no perder la señal de
@@ -238,24 +285,6 @@ class DashboardController:
             # 4. ETIQUETA DETECTADA — iniciar timer (watchdog cuenta desde aquí,
             # independientemente de si el frame está borroso o no)
             self.pallet_service.iniciar_temporizador()
-
-            # 4.5 GATE DE NITIDEZ — evita gastar el reintento CLAHE en un frame con
-            # blur de movimiento que no tiene ninguna posibilidad de decodificar.
-            # El watchdog (paso 1) sigue corriendo igual mientras tanto.
-            if not self.scanner_service.es_frame_nitido(frame):
-                contador_borroso += 1
-                if not frame_estaba_borroso:
-                    self.view.mostrar_estado_borroso()
-                    frame_estaba_borroso = True
-                if contador_borroso % 20 == 0:
-                    logger.debug("Frame borroso consecutivo #%d, decodificación omitida", contador_borroso)
-                time.sleep(0.05)
-                continue
-
-            if frame_estaba_borroso:
-                self.view.reanudar_estado_escaneo()
-                frame_estaba_borroso = False
-                contador_borroso = 0
 
             # 5. DECODE con el mismo frame (ROIs y píxeles perfectamente alineados)
             try:
