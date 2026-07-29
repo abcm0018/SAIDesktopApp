@@ -279,7 +279,45 @@ class DashboardController:
             # "hay una etiqueta presente" que arranca el watchdog — ver 4)
             rois = self.yolo_service.detectar(frame)
             if not rois:
-                time.sleep(0.05)   # sin etiqueta, ceder CPU sin I/O de disco
+                try:
+                    # Al recibir una lista de ROI vacía, ScannerService
+                    # intenta decodificar la región central del fotograma.
+                    scan_result = self.scanner_service.procesar_zonas(frame, rois)
+
+                    hay_datos_utiles = any((
+                        scan_result.sscc,
+                        scan_result.ean,
+                        scan_result.batch_number,
+                        scan_result.product_use_by_date,
+                        scan_result.packaging_date,
+                        scan_result.production_time,
+                    ))
+
+                    # La región central no ha proporcionado información.
+                    if not hay_datos_utiles:
+                        time.sleep(0.05)
+                        continue
+
+                    # La región central ha recuperado algún campo GS1.
+                    self.pallet_service.iniciar_temporizador()
+
+                    hubo_cambios = self.pallet_service.procesar_nuevos_datos(
+                        scan_result
+                    )
+
+                    if hubo_cambios:
+                        palet_actual = self.pallet_service.get_palet_actual()
+                        self.view.actualizar_datos_palet(palet_actual)
+
+                        if palet_actual.is_fully_captured():
+                            self._finalizar_palet()
+
+                except Exception as e:
+                    logger.error(
+                        "Error procesando la región central: %s",
+                        e,
+                    )
+
                 continue
 
             # 4. ETIQUETA DETECTADA — iniciar timer (watchdog cuenta desde aquí,
