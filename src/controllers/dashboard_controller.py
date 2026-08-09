@@ -279,6 +279,7 @@ class DashboardController:
             # "hay una etiqueta presente" que arranca el watchdog — ver 4)
             rois = self.yolo_service.detectar(frame)
             if not rois:
+
                 try:
                     # Al recibir una lista de ROI vacía, ScannerService
                     # intenta decodificar la región central del fotograma.
