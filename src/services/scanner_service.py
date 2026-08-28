@@ -73,11 +73,13 @@ class ScannerService:
                         try_rotate=False,
                     )
 
+                    lectura_gs1_util = self._contiene_datos_gs1_utiles(res)
+
                     # ---------------------------------------------------------
                     # INTENTO 2: ROI ampliada
                     # ---------------------------------------------------------
 
-                    if not res:
+                    if not lectura_gs1_util:
                         pad_x_ampliado = max(40, int(w * 0.25))
                         pad_y_ampliado = max(30, int(h * 0.25))
 
@@ -96,11 +98,13 @@ class ScannerService:
                             try_rotate=False,
                         )
 
+                        lectura_gs1_util = self._contiene_datos_gs1_utiles(res)
+
                     # ---------------------------------------------------------
                     # INTENTO 3: ROI ampliada con CLAHE y rotación
                     # ---------------------------------------------------------
 
-                    if not res:
+                    if not lectura_gs1_util:
                         roi_enhanced = self.clahe.apply(
                             roi_ampliada
                         )
@@ -110,9 +114,11 @@ class ScannerService:
                             try_rotate=True,
                         )
 
+                        lectura_gs1_util = self._contiene_datos_gs1_utiles(res)
+
                     # Intento 4: corregir inclinaciones pequeñas en ambos sentidos.
                     # Solo se ejecuta cuando las estrategias anteriores han fallado.
-                    if not res:
+                    if not lectura_gs1_util:
                         for angulo in (-15, 15):
                             roi_rotada = self._rotar_roi(
                                 roi_enhanced,
@@ -124,14 +130,17 @@ class ScannerService:
                                 try_rotate=False,
                             )
 
-                            if res:
+                            lectura_gs1_util = self._contiene_datos_gs1_utiles(res)
+
+                            if lectura_gs1_util:
                                 logger.debug(
-                                    "Código recuperado corrigiendo una inclinación de %d grados.",
+                                    "Código GS1 útil recuperado corrigiendo una inclinación de %d grados.",
                                     angulo,
                                 )
                                 break
 
-                    codigos_leidos.extend(res)
+                    if lectura_gs1_util:
+                        codigos_leidos.extend(res)
 
             # --- ESTRATEGIA B: FALLBACK CUANDO LAS ROI NO DAN RESULTADO ---
             if not codigos_leidos:
@@ -144,13 +153,13 @@ class ScannerService:
                         try_rotate=False,
                     )
 
-                    if resultados_frame:
+                    if self._contiene_datos_gs1_utiles(resultados_frame):
                         logger.debug(
-                            "Fallback de fotograma completo: %d código(s) recuperado(s).",
+                            "Fallback de fotograma completo: %d código(s) GS1 útil(es) recuperado(s).",
                             len(resultados_frame),
                         )
 
-                    codigos_leidos.extend(resultados_frame)
+                        codigos_leidos.extend(resultados_frame)
 
                 else:
                     # Si YOLO no encontró ninguna región, se conserva el intento
@@ -221,6 +230,30 @@ class ScannerService:
 
         return palet_result
 
+    @staticmethod
+    def _contiene_datos_gs1_utiles(resultados) -> bool:
+        """
+        Comprueba si al menos uno de los resultados de ZXing produce
+        algún campo reconocido por GS1Parser.
+
+        Una decodificación simbólicamente correcta no se considera
+        suficiente para detener los reintentos si el texto obtenido
+        no aporta información GS1 utilizable por la aplicación.
+        """
+        for result in resultados or []:
+            raw_text = result.text or ""
+
+            if not isinstance(raw_text, str):
+                raw_text = str(raw_text)
+
+            if len(raw_text) < 5:
+                continue
+
+            if GS1Parser.parse(raw_text):
+                return True
+
+        return False
+
     def _calcular_nitidez(self, imagen) -> float:
         """
         Calcula la nitidez mediante la varianza del Laplaciano.
@@ -277,13 +310,17 @@ class ScannerService:
         try:
             resultados = self._decodificar_recorte(gray_img, try_rotate=False)
 
-            if not resultados:
+            if not self._contiene_datos_gs1_utiles(resultados):
                 img_enhanced = self.clahe.apply(gray_img)
                 resultados = self._decodificar_recorte(img_enhanced, try_rotate=True)
 
             procesados = set()
             for result in resultados:
-                raw_text = result.text
+                raw_text = result.text or ""
+
+                if not isinstance(raw_text, str):
+                    raw_text = str(raw_text)
+
                 if raw_text in procesados or len(raw_text) < 5:
                     continue
                 procesados.add(raw_text)
@@ -341,7 +378,7 @@ class ScannerService:
         )
 
     def _decodificar_recorte(self, imagen_gris: np.ndarray, try_rotate: bool = False):
-        """Wrapper para llamar a zxing-cpp con los parámetros óptimos"""
+        """Wrapper para llamar a zxing-C++ con los parámetros configurados en el prototipo"""
         if imagen_gris.size == 0:
             return []
 
